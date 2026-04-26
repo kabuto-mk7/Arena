@@ -67,6 +67,7 @@ struct InputPacket {
     uint8_t crouchHeld;
     uint8_t weaponSlot;
     uint8_t firePressed;
+    uint8_t fireHeld;
     uint8_t dashPressed;
     int8_t dashMoveX;
     int8_t dashMoveZ;

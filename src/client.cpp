@@ -25,6 +25,9 @@ constexpr double ReloadFrameDuration = 0.13;
 constexpr double KnifeAttackFrameDuration = 0.09;
 constexpr double KnifeInspectFrameDuration = 0.13;
 constexpr double KnifeEquipSlideDuration = 0.22;
+constexpr double LightningGunStartupFrameDuration = 0.05;
+constexpr double LightningGunWinddownFrameDuration = 0.05;
+constexpr float LightningLoopFadeOutSeconds = 0.14f;
 constexpr float RecoilKickAmount = 18.0f;
 constexpr int MaxShells = 2;
 constexpr int MaxReserveAmmo = 32;
@@ -32,6 +35,7 @@ constexpr int AmmoPickupAmount = 6;
 
 enum class WeaponSlot : uint8_t {
     Shotgun = 1,
+    LightningGun = 2,
     Knife = 3,
 };
 
@@ -39,6 +43,9 @@ enum class WeaponAnimMode {
     Idle,
     ShotgunFire,
     ShotgunReload,
+    LightningGunStartup,
+    LightningGunFiring,
+    LightningGunWinddown,
     KnifeAttack,
     KnifeInspect,
     KnifeEquip
@@ -110,6 +117,10 @@ struct ClientState {
     bool logoLoaded = false;
     std::array<Texture2D, 8> shotgunFrames{};
     int shotgunFrameCount = 0;
+    Texture2D lightningGunIdle{};
+    std::array<Texture2D, 3> lightningGunStartupFrames{};
+    int lightningGunStartupFrameCount = 0;
+    Texture2D lightningGunFiring{};
     Texture2D knifeIdle{};
     std::array<Texture2D, 4> knifeAttackFrames{};
     int knifeAttackFrameCount = 0;
@@ -126,9 +137,21 @@ struct ClientState {
     Sound ammoPickup{};
     std::array<Sound, 4> shotgunReloadSounds{};
     int shotgunReloadSoundCount = 0;
+    Sound lightningFireStart{};
+    std::array<Sound, 4> lightningFireStartAliases{};
+    int lightningFireStartAliasCount = 0;
+    int lightningFireStartAliasNext = 0;
+    Music lightningFireLoop{};
+    bool lightningAudioLoaded = false;
+    bool lightningLoopPlaying = false;
+    bool lightningLoopFadingOut = false;
+    float lightningLoopVolume = 1.0f;
     Sound knifeEquip{};
     Sound hitSound{};
     bool hitSoundLoaded = false;
+    std::array<Sound, 8> hitSoundAliases{};
+    int hitSoundAliasCount = 0;
+    int hitSoundAliasNext = 0;
     std::array<Sound, 4> footstepSounds{};
     int footstepSoundCount = 0;
 
@@ -176,6 +199,24 @@ arena::Vec3 lerpVec3(arena::Vec3 a, arena::Vec3 b, float t) {
         a.y + (b.y - a.y) * t,
         a.z + (b.z - a.z) * t
     };
+}
+
+Sound& nextAliasOrBase(Sound& base, std::array<Sound, 8>& aliases, int aliasCount, int& nextIndex) {
+    if (aliasCount <= 0) {
+        return base;
+    }
+    Sound& chosen = aliases[nextIndex];
+    nextIndex = (nextIndex + 1) % aliasCount;
+    return chosen;
+}
+
+Sound& nextAliasOrBase(Sound& base, std::array<Sound, 4>& aliases, int aliasCount, int& nextIndex) {
+    if (aliasCount <= 0) {
+        return base;
+    }
+    Sound& chosen = aliases[nextIndex];
+    nextIndex = (nextIndex + 1) % aliasCount;
+    return chosen;
 }
 
 float easeOutCubic(float t) {
@@ -250,6 +291,15 @@ Sound loadSoundAsset(const std::string& relativePath) {
     return sound;
 }
 
+Music loadMusicAsset(const std::string& relativePath) {
+    const std::string path = resolveAssetPath(relativePath);
+    Music music = LoadMusicStream(path.c_str());
+    if (music.ctxData == nullptr) {
+        throw std::runtime_error("Failed to load music: " + path);
+    }
+    return music;
+}
+
 void tileMeshUV(Mesh& mesh, float tileU, float tileV) {
     if (mesh.texcoords == nullptr || mesh.vertexCount <= 0) {
         return;
@@ -317,6 +367,17 @@ void initAssets(ClientState& state) {
         SetTextureWrap(state.shotgunFrames[i], TEXTURE_WRAP_CLAMP);
     }
     state.shotgunFrameCount = static_cast<int>(shotgunFrameFiles.size());
+    state.lightningGunIdle = loadTextureAsset("assets\\weapons\\LG\\lgidle.png");
+    state.lightningGunStartupFrames[0] = loadTextureAsset("assets\\weapons\\LG\\lgfire1.png");
+    state.lightningGunStartupFrames[1] = loadTextureAsset("assets\\weapons\\LG\\lgfire2.png");
+    state.lightningGunStartupFrames[2] = loadTextureAsset("assets\\weapons\\LG\\lgfire3.png");
+    state.lightningGunStartupFrameCount = 3;
+    state.lightningGunFiring = loadTextureAsset("assets\\weapons\\LG\\lgfiring.png");
+    SetTextureWrap(state.lightningGunIdle, TEXTURE_WRAP_CLAMP);
+    SetTextureWrap(state.lightningGunFiring, TEXTURE_WRAP_CLAMP);
+    for (Texture2D& frame : state.lightningGunStartupFrames) {
+        SetTextureWrap(frame, TEXTURE_WRAP_CLAMP);
+    }
     state.knifeIdle = loadTextureAsset("assets\\weapons\\karambit\\idle.png");
     SetTextureWrap(state.knifeIdle, TEXTURE_WRAP_CLAMP);
     state.knifeAttackFrames[0] = loadTextureAsset("assets\\weapons\\karambit\\attack1.png");
@@ -348,6 +409,20 @@ void initAssets(ClientState& state) {
     state.shotgunReloadSounds[2] = loadSoundAsset("assets\\weapons\\doubleshotgun\\reload3.wav");
     state.shotgunReloadSounds[3] = loadSoundAsset("assets\\weapons\\doubleshotgun\\reload4.wav");
     state.shotgunReloadSoundCount = 4;
+    try {
+        state.lightningFireStart = loadSoundAsset("assets\\weapons\\LG\\fire.ogg");
+        state.lightningFireLoop = loadMusicAsset("assets\\weapons\\LG\\loop.ogg");
+        state.lightningFireLoop.looping = true;
+        state.lightningFireStartAliasCount = static_cast<int>(state.lightningFireStartAliases.size());
+        for (int i = 0; i < state.lightningFireStartAliasCount; ++i) {
+            state.lightningFireStartAliases[i] = LoadSoundAlias(state.lightningFireStart);
+        }
+        state.lightningLoopVolume = 1.0f;
+        SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
+        state.lightningAudioLoaded = true;
+    } catch (...) {
+        state.lightningAudioLoaded = false;
+    }
     state.knifeEquip = loadSoundAsset("assets\\weapons\\karambit\\equip.wav");
     try {
         state.hitSound = loadSoundAsset("assets\\sound\\hit.mp3");
@@ -362,6 +437,11 @@ void initAssets(ClientState& state) {
     }
     if (state.hitSoundLoaded) {
         SetSoundVolume(state.hitSound, state.hitSoundVolume);
+        state.hitSoundAliasCount = static_cast<int>(state.hitSoundAliases.size());
+        for (int i = 0; i < state.hitSoundAliasCount; ++i) {
+            state.hitSoundAliases[i] = LoadSoundAlias(state.hitSound);
+            SetSoundVolume(state.hitSoundAliases[i], state.hitSoundVolume);
+        }
     }
     state.footstepSounds[0] = loadSoundAsset("assets\\sound\\boots1.wav");
     state.footstepSounds[1] = loadSoundAsset("assets\\sound\\boots2.wav");
@@ -395,8 +475,25 @@ void unloadAssets(ClientState& state) {
         for (int i = 0; i < state.shotgunReloadSoundCount; ++i) {
             UnloadSound(state.shotgunReloadSounds[i]);
         }
+        if (state.lightningAudioLoaded) {
+            StopMusicStream(state.lightningFireLoop);
+            UnloadMusicStream(state.lightningFireLoop);
+            for (int i = 0; i < state.lightningFireStartAliasCount; ++i) {
+                UnloadSoundAlias(state.lightningFireStartAliases[i]);
+            }
+            state.lightningFireStartAliasCount = 0;
+            UnloadSound(state.lightningFireStart);
+            state.lightningAudioLoaded = false;
+            state.lightningLoopPlaying = false;
+            state.lightningLoopFadingOut = false;
+            state.lightningLoopVolume = 1.0f;
+        }
         UnloadSound(state.knifeEquip);
         if (state.hitSoundLoaded) {
+            for (int i = 0; i < state.hitSoundAliasCount; ++i) {
+                UnloadSoundAlias(state.hitSoundAliases[i]);
+            }
+            state.hitSoundAliasCount = 0;
             UnloadSound(state.hitSound);
             state.hitSoundLoaded = false;
         }
@@ -409,6 +506,15 @@ void unloadAssets(ClientState& state) {
 
     for (int i = 0; i < state.shotgunFrameCount; ++i) {
         UnloadTexture(state.shotgunFrames[i]);
+    }
+    if (state.lightningGunIdle.id != 0) {
+        UnloadTexture(state.lightningGunIdle);
+    }
+    if (state.lightningGunFiring.id != 0) {
+        UnloadTexture(state.lightningGunFiring);
+    }
+    for (int i = 0; i < state.lightningGunStartupFrameCount; ++i) {
+        UnloadTexture(state.lightningGunStartupFrames[i]);
     }
     if (state.knifeIdle.id != 0) {
         UnloadTexture(state.knifeIdle);
@@ -456,6 +562,36 @@ void equipWeapon(ClientState& state, WeaponSlot slot, double now) {
         }
     } else {
         state.weaponAnimMode = WeaponAnimMode::Idle;
+    }
+}
+
+void updateLightningAudio(ClientState& state) {
+    if (!state.audioReady || !state.lightningAudioLoaded) {
+        return;
+    }
+    const bool lgFiring = state.equippedWeapon == WeaponSlot::LightningGun && state.weaponAnimMode == WeaponAnimMode::LightningGunFiring;
+    if (lgFiring) {
+        if (!state.lightningLoopPlaying) {
+            state.lightningLoopVolume = 1.0f;
+            SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
+            PlayMusicStream(state.lightningFireLoop);
+            state.lightningLoopPlaying = true;
+        }
+        state.lightningLoopFadingOut = false;
+        UpdateMusicStream(state.lightningFireLoop);
+    } else if (state.lightningLoopPlaying) {
+        state.lightningLoopFadingOut = true;
+        UpdateMusicStream(state.lightningFireLoop);
+        const float dt = std::max(GetFrameTime(), 0.00001f);
+        state.lightningLoopVolume = std::max(0.0f, state.lightningLoopVolume - dt / LightningLoopFadeOutSeconds);
+        SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
+        if (state.lightningLoopVolume <= 0.0f) {
+            StopMusicStream(state.lightningFireLoop);
+            state.lightningLoopPlaying = false;
+            state.lightningLoopFadingOut = false;
+            state.lightningLoopVolume = 1.0f;
+            SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
+        }
     }
 }
 
@@ -604,6 +740,9 @@ void drawSettingsMenu(ClientState& state) {
         if (rightAdjust) state.hitSoundVolume = std::min(1.0f, state.hitSoundVolume + 0.05f);
         if (state.hitSoundLoaded) {
             SetSoundVolume(state.hitSound, state.hitSoundVolume);
+            for (int i = 0; i < state.hitSoundAliasCount; ++i) {
+                SetSoundVolume(state.hitSoundAliases[i], state.hitSoundVolume);
+            }
         }
     }
 
@@ -657,6 +796,7 @@ void sendInput(ClientState& state) {
     const bool holdJump = keyDown(KEY_SPACE);
     packet.jumpPressed = (state.jumpQueued || holdJump) ? 1 : 0;
     packet.firePressed = state.fireQueued ? 1 : 0;
+    packet.fireHeld = IsMouseButtonDown(MOUSE_BUTTON_LEFT) ? 1 : 0;
     packet.dashPressed = state.dashQueued ? 1 : 0;
     packet.dashMoveX = state.dashMoveX;
     packet.dashMoveZ = state.dashMoveZ;
@@ -747,7 +887,12 @@ void syncLocalPosition(ClientState& state) {
         state.localDead = it->second.dead;
         if (state.localHitConfirmInitialized && it->second.hitConfirmCount != state.localHitConfirmCount &&
             state.hitSoundEnabled && state.hitSoundLoaded && state.audioReady) {
-            PlaySound(state.hitSound);
+            const uint16_t delta = static_cast<uint16_t>(it->second.hitConfirmCount - state.localHitConfirmCount);
+            const int plays = std::min<int>(delta == 0 ? 0 : delta, 8);
+            for (int i = 0; i < plays; ++i) {
+                Sound& s = nextAliasOrBase(state.hitSound, state.hitSoundAliases, state.hitSoundAliasCount, state.hitSoundAliasNext);
+                PlaySound(s);
+            }
         }
         if (state.localHitConfirmInitialized && it->second.hitConfirmCount != state.localHitConfirmCount) {
             const auto targetIt = state.players.find(it->second.lastHitTargetId);
@@ -871,6 +1016,7 @@ void updateViewmodelAndFootsteps(ClientState& state, double now, float dt) {
     const bool moving = keyDown(KEY_W) || keyDown(KEY_A) || keyDown(KEY_S) || keyDown(KEY_D);
     const bool grounded = state.localPosition.y <= 0.05f;
     const bool knifeEquipped = state.equippedWeapon == WeaponSlot::Knife;
+    const bool lgEquipped = state.equippedWeapon == WeaponSlot::LightningGun;
 
     if (knifeEquipped) {
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && now >= state.nextWeaponActionAt) {
@@ -881,6 +1027,27 @@ void updateViewmodelAndFootsteps(ClientState& state, double now, float dt) {
             state.weaponAnimMode = WeaponAnimMode::KnifeInspect;
             state.weaponAnimStartAt = now;
             state.nextWeaponActionAt = now + static_cast<double>(state.knifeInspectFrameCount) * KnifeInspectFrameDuration;
+        }
+    } else if (lgEquipped) {
+        const bool triggerHeld = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        if (triggerHeld) {
+            if (state.weaponAnimMode == WeaponAnimMode::Idle || state.weaponAnimMode == WeaponAnimMode::LightningGunWinddown) {
+                state.weaponAnimMode = WeaponAnimMode::LightningGunStartup;
+                state.weaponAnimStartAt = now;
+                if (state.audioReady && state.lightningAudioLoaded) {
+                    Sound& s = nextAliasOrBase(
+                        state.lightningFireStart,
+                        state.lightningFireStartAliases,
+                        state.lightningFireStartAliasCount,
+                        state.lightningFireStartAliasNext);
+                    PlaySound(s);
+                }
+            }
+        } else {
+            if (state.weaponAnimMode == WeaponAnimMode::LightningGunFiring || state.weaponAnimMode == WeaponAnimMode::LightningGunStartup) {
+                state.weaponAnimMode = WeaponAnimMode::LightningGunWinddown;
+                state.weaponAnimStartAt = now;
+            }
         }
     } else {
         if (state.weaponAnimMode == WeaponAnimMode::Idle && state.shellsInGun == 0 && state.reserveAmmo > 0) {
@@ -951,6 +1118,10 @@ void updateViewmodelAndFootsteps(ClientState& state, double now, float dt) {
 }
 
 int weaponFrameIndex(const ClientState& state, double now) {
+    if (state.equippedWeapon == WeaponSlot::LightningGun) {
+        return -1;
+    }
+
     if (state.equippedWeapon == WeaponSlot::Knife) {
         if (state.knifeIdle.id == 0) {
             return -1;
@@ -983,6 +1154,38 @@ int weaponFrameIndex(const ClientState& state, double now) {
 
 void updateWeaponAnimationState(ClientState& state, double now) {
     if (state.weaponAnimMode == WeaponAnimMode::Idle) {
+        return;
+    }
+
+    if (state.weaponAnimMode == WeaponAnimMode::LightningGunStartup) {
+        const double totalDuration = static_cast<double>(state.lightningGunStartupFrameCount) * LightningGunStartupFrameDuration;
+        if (now - state.weaponAnimStartAt >= totalDuration) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+                state.weaponAnimMode = WeaponAnimMode::LightningGunFiring;
+            } else {
+                state.weaponAnimMode = WeaponAnimMode::LightningGunWinddown;
+                state.weaponAnimStartAt = now;
+            }
+        }
+        return;
+    }
+
+    if (state.weaponAnimMode == WeaponAnimMode::LightningGunFiring) {
+        if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            state.weaponAnimMode = WeaponAnimMode::LightningGunWinddown;
+            state.weaponAnimStartAt = now;
+        }
+        return;
+    }
+
+    if (state.weaponAnimMode == WeaponAnimMode::LightningGunWinddown) {
+        const double totalDuration = static_cast<double>(state.lightningGunStartupFrameCount) * LightningGunWinddownFrameDuration;
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            state.weaponAnimMode = WeaponAnimMode::LightningGunStartup;
+            state.weaponAnimStartAt = now;
+        } else if (now - state.weaponAnimStartAt >= totalDuration) {
+            state.weaponAnimMode = WeaponAnimMode::Idle;
+        }
         return;
     }
 
@@ -1048,7 +1251,21 @@ void drawViewmodel(const ClientState& state, double now) {
 
     const int frameIndex = weaponFrameIndex(state, now);
     const Texture2D* frame = nullptr;
-    if (state.equippedWeapon == WeaponSlot::Knife) {
+    if (state.equippedWeapon == WeaponSlot::LightningGun) {
+        if (state.weaponAnimMode == WeaponAnimMode::LightningGunStartup) {
+            const int step = static_cast<int>((now - state.weaponAnimStartAt) / LightningGunStartupFrameDuration);
+            const int index = std::clamp(step, 0, state.lightningGunStartupFrameCount - 1);
+            frame = &state.lightningGunStartupFrames[index];
+        } else if (state.weaponAnimMode == WeaponAnimMode::LightningGunFiring) {
+            frame = &state.lightningGunFiring;
+        } else if (state.weaponAnimMode == WeaponAnimMode::LightningGunWinddown) {
+            const int step = static_cast<int>((now - state.weaponAnimStartAt) / LightningGunWinddownFrameDuration);
+            const int reverseIndex = (state.lightningGunStartupFrameCount - 1) - std::clamp(step, 0, state.lightningGunStartupFrameCount - 1);
+            frame = &state.lightningGunStartupFrames[reverseIndex];
+        } else {
+            frame = &state.lightningGunIdle;
+        }
+    } else if (state.equippedWeapon == WeaponSlot::Knife) {
         if (state.weaponAnimMode == WeaponAnimMode::KnifeAttack && frameIndex >= 0 && frameIndex < state.knifeAttackFrameCount) {
             frame = &state.knifeAttackFrames[frameIndex];
         } else if (state.weaponAnimMode == WeaponAnimMode::KnifeInspect &&
@@ -1076,12 +1293,13 @@ void drawViewmodel(const ClientState& state, double now) {
     const float screenWidth = static_cast<float>(GetScreenWidth());
     const float screenHeight = static_cast<float>(GetScreenHeight());
     const bool knifeEquipped = state.equippedWeapon == WeaponSlot::Knife;
-    const float targetWidth = screenWidth * (knifeEquipped ? 0.47f : 0.50f);
+    const bool lgEquipped = state.equippedWeapon == WeaponSlot::LightningGun;
+    const float targetWidth = screenWidth * (knifeEquipped ? 0.47f : (lgEquipped ? 0.54f : 0.50f));
     const float scale = targetWidth / static_cast<float>(frameTex.width);
     const float drawWidth = static_cast<float>(frameTex.width) * scale;
     const float drawHeight = static_cast<float>(frameTex.height) * scale;
     const float bobY = std::sin(state.weaponBobPhase) * (knifeEquipped ? 6.0f : 8.0f);
-    const float recoilY = knifeEquipped ? 0.0f : state.recoilOffset;
+    const float recoilY = (knifeEquipped || lgEquipped) ? 0.0f : state.recoilOffset;
     float equipSlideY = 0.0f;
     if (knifeEquipped && state.weaponAnimMode == WeaponAnimMode::KnifeEquip) {
         const float t = std::clamp(static_cast<float>((now - state.weaponAnimStartAt) / KnifeEquipSlideDuration), 0.0f, 1.0f);
@@ -1089,13 +1307,99 @@ void drawViewmodel(const ClientState& state, double now) {
     }
 
     const float baseX = (screenWidth - drawWidth) * 0.5f;
-    const float baseY = knifeEquipped ? (screenHeight - drawHeight + 70.0f) : (screenHeight - drawHeight + 92.0f);
+    const float baseY = knifeEquipped ? (screenHeight - drawHeight + 70.0f) : (lgEquipped ? (screenHeight - drawHeight + 88.0f) : (screenHeight - drawHeight + 92.0f));
     const Vector2 pos{
         baseX,
         baseY + bobY + recoilY + equipSlideY
     };
 
     DrawTextureEx(frameTex, pos, 0.0f, scale, WHITE);
+}
+
+void drawLightningBeamVfx(const ClientState& state, double now) {
+    const bool lgEquipped = state.equippedWeapon == WeaponSlot::LightningGun;
+    const bool active = state.weaponAnimMode == WeaponAnimMode::LightningGunFiring || state.weaponAnimMode == WeaponAnimMode::LightningGunStartup;
+    if (!lgEquipped || !active) {
+        return;
+    }
+
+    const float sw = static_cast<float>(GetScreenWidth());
+    const float sh = static_cast<float>(GetScreenHeight());
+    const Vector2 start{sw * 0.545f, sh * 0.82f};
+    const Vector2 end{sw * 0.5f, sh * 0.5f};
+
+    Vector2 dir{end.x - start.x, end.y - start.y};
+    const float len = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+    if (len <= 0.001f) {
+        return;
+    }
+    dir.x /= len;
+    dir.y /= len;
+    const Vector2 normal{-dir.y, dir.x};
+
+    auto hash01 = [](uint32_t x) -> float {
+        x ^= x >> 16;
+        x *= 0x7feb352dU;
+        x ^= x >> 15;
+        x *= 0x846ca68bU;
+        x ^= x >> 16;
+        return static_cast<float>(x & 0x00ffffffU) / 16777215.0f;
+    };
+
+    constexpr int maxPoints = 256;
+    std::array<Vector2, maxPoints> points{};
+    int count = 2;
+    points[0] = start;
+    points[1] = end;
+
+    // Midpoint-displacement bolt (classic realtime lightning method).
+    const int timeSlice = static_cast<int>(now * 45.0);
+    float displacement = 30.0f;
+    for (int level = 0; level < 5; ++level) {
+        std::array<Vector2, maxPoints> next{};
+        int nextCount = 0;
+        for (int i = 0; i < count - 1 && nextCount < maxPoints - 2; ++i) {
+            const Vector2 a = points[i];
+            const Vector2 b = points[i + 1];
+            next[nextCount++] = a;
+
+            const Vector2 mid{(a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f};
+            const uint32_t seed = static_cast<uint32_t>((i + 1) * 131 + level * 977 + timeSlice * 43);
+            const float j = (hash01(seed) * 2.0f - 1.0f) * displacement;
+            next[nextCount++] = {mid.x + normal.x * j, mid.y + normal.y * j};
+        }
+        next[nextCount++] = points[count - 1];
+        points = next;
+        count = nextCount;
+        displacement *= 0.52f;
+    }
+    points[count - 1] = end;
+
+    BeginBlendMode(BLEND_ADDITIVE);
+    for (int i = 0; i < count - 1; ++i) {
+        const float t = static_cast<float>(i) / static_cast<float>(std::max(1, count - 1));
+        const float widthCore = 7.6f * (1.0f - t * 0.48f);
+        const float widthGlow = widthCore * 3.0f;
+        DrawLineEx(points[i], points[i + 1], widthGlow, Color{120, 255, 245, 75});
+        DrawLineEx(points[i], points[i + 1], widthCore, Color{135, 255, 245, 245});
+        DrawLineEx(points[i], points[i + 1], std::max(1.4f, widthCore * 0.32f), Color{235, 255, 250, 205});
+
+        // Secondary branch arcs for a more "lightning" silhouette.
+        if ((i % 6) == 2) {
+            const Vector2 p = points[i];
+            const uint32_t bseed = static_cast<uint32_t>((i + 7) * 193 + timeSlice * 57);
+            const float side = hash01(bseed) > 0.5f ? 1.0f : -1.0f;
+            const float blen = 10.0f + hash01(bseed + 11) * 18.0f;
+            const Vector2 bend{p.x + normal.x * blen * side, p.y + normal.y * blen * side};
+            DrawLineEx(p, bend, widthCore * 0.38f, Color{120, 245, 238, 140});
+            DrawLineEx(p, bend, std::max(1.0f, widthCore * 0.16f), Color{220, 255, 250, 150});
+        }
+    }
+
+    DrawCircleV(end, 7.0f, Color{200, 255, 250, 235});
+    DrawCircleV(end, 15.0f, Color{115, 250, 242, 135});
+    DrawCircleV(end, 25.0f, Color{80, 230, 245, 70});
+    EndBlendMode();
 }
 
 void render(ClientState& state, double now) {
@@ -1124,6 +1428,7 @@ void render(ClientState& state, double now) {
     }
 
     EndMode3D();
+    drawLightningBeamVfx(state, now);
     for (const DamagePopup& popup : state.damagePopups) {
         const float t = std::clamp(popup.age / popup.lifetime, 0.0f, 1.0f);
         const unsigned char alpha = static_cast<unsigned char>((1.0f - t) * 255.0f);
@@ -1149,10 +1454,12 @@ void render(ClientState& state, double now) {
         ? "Connected as player " + std::to_string(state.localPlayerId) + " | players: " + std::to_string(state.players.size())
         : "Connecting to server...";
     DrawText(status.c_str(), 16, 16, 20, RAYWHITE);
-    const std::string weaponLabel = (state.equippedWeapon == WeaponSlot::Knife) ? "Karambit" : "Shotgun";
+    std::string weaponLabel = "Shotgun";
+    if (state.equippedWeapon == WeaponSlot::Knife) weaponLabel = "Karambit";
+    if (state.equippedWeapon == WeaponSlot::LightningGun) weaponLabel = "Lightning Gun";
     const std::string ammoText = (state.equippedWeapon == WeaponSlot::Shotgun)
         ? ("Shotgun: " + std::to_string(state.shellsInGun) + "/" + std::to_string(MaxShells) + " | Reserve: " + std::to_string(state.reserveAmmo))
-        : "Karambit ready";
+        : ((state.equippedWeapon == WeaponSlot::LightningGun) ? "LG beam active while holding fire" : "Karambit ready");
     DrawText(("Weapon: " + weaponLabel).c_str(), 16, 42, 20, RAYWHITE);
     DrawText(ammoText.c_str(), 16, 68, 20, RAYWHITE);
     const std::string t1Clock = formatClock(state.team1TimeLeftSeconds);
@@ -1178,7 +1485,7 @@ void render(ClientState& state, double now) {
     if (state.localDead) {
         DrawText("You are dead - respawning...", GetScreenWidth() / 2 - 190, GetScreenHeight() / 2 - 70, 30, RED);
     }
-    DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | A/D double-tap air dash | Shift crouch | 1 shotgun | 3 knife | LMB attack/fire | F inspect | Esc menu", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
+    DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | A/D double-tap air dash | Shift crouch | 1 shotgun | 2 lightning gun | 3 knife | LMB attack/fire | F inspect | Esc menu", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
     DrawFPS(GetScreenWidth() - 95, 12);
 
     EndDrawing();
@@ -1268,6 +1575,9 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_ONE)) {
                 equipWeapon(state, WeaponSlot::Shotgun, arena::secondsNow());
             }
+            if (IsKeyPressed(KEY_TWO)) {
+                equipWeapon(state, WeaponSlot::LightningGun, arena::secondsNow());
+            }
             if (IsKeyPressed(KEY_THREE)) {
                 equipWeapon(state, WeaponSlot::Knife, arena::secondsNow());
             }
@@ -1280,6 +1590,13 @@ int main(int argc, char** argv) {
             }
             if (IsKeyPressed(KEY_ESCAPE)) {
                 state.screenMode = ScreenMode::MainMenu;
+                if (state.lightningLoopPlaying && state.lightningAudioLoaded) {
+                    StopMusicStream(state.lightningFireLoop);
+                    state.lightningLoopPlaying = false;
+                    state.lightningLoopFadingOut = false;
+                    state.lightningLoopVolume = 1.0f;
+                    SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
+                }
                 state.mainMenuOpenedAt = GetTime();
                 EnableCursor();
                 continue;
@@ -1306,6 +1623,7 @@ int main(int argc, char** argv) {
             updateDamagePopups(state, dt);
             updateViewmodelAndFootsteps(state, now, dt);
             updateWeaponAnimationState(state, now);
+            updateLightningAudio(state);
             render(state, now);
         }
 

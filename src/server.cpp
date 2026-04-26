@@ -10,6 +10,7 @@ namespace {
 
 enum class WeaponSlot : uint8_t {
     Shotgun = 1,
+    LightningGun = 2,
     Knife = 3,
 };
 
@@ -37,6 +38,9 @@ constexpr float ShotgunFireInterval = 0.24f;
 constexpr float KnifeRange = 2.2f;
 constexpr int KnifeDamage = 45;
 constexpr float KnifeFireInterval = 0.35f;
+constexpr float LightningGunRange = 46.0f;
+constexpr int LightningGunDamagePerTick = 7;
+constexpr float LightningGunTickInterval = 0.05f;
 constexpr float RespawnDelaySeconds = 3.0f;
 
 struct Player {
@@ -240,7 +244,12 @@ void integrateInput(Player& player, const arena::InputPacket& input, double now)
         return;
     }
 
-    const WeaponSlot inputWeapon = (input.weaponSlot == static_cast<uint8_t>(WeaponSlot::Shotgun)) ? WeaponSlot::Shotgun : WeaponSlot::Knife;
+    WeaponSlot inputWeapon = WeaponSlot::Knife;
+    if (input.weaponSlot == static_cast<uint8_t>(WeaponSlot::Shotgun)) {
+        inputWeapon = WeaponSlot::Shotgun;
+    } else if (input.weaponSlot == static_cast<uint8_t>(WeaponSlot::LightningGun)) {
+        inputWeapon = WeaponSlot::LightningGun;
+    }
     player.equippedWeapon = inputWeapon;
     player.yaw = input.yaw;
     player.pitch = arena::clamp(input.pitch, -arena::MaxLookPitch, arena::MaxLookPitch);
@@ -382,7 +391,18 @@ bool rayHitsPlayerVolumes(const arena::Vec3& origin, const arena::Vec3& dir, flo
 }
 
 bool processCombatInput(Player& attacker, std::vector<Player>& players, const arena::InputPacket& input, double now) {
-    if (attacker.dead || input.firePressed == 0 || now < attacker.nextFireAt) {
+    if (attacker.dead) {
+        return false;
+    }
+
+    bool wantsAttack = false;
+    if (attacker.equippedWeapon == WeaponSlot::LightningGun) {
+        wantsAttack = input.fireHeld != 0;
+    } else {
+        wantsAttack = input.firePressed != 0;
+    }
+
+    if (!wantsAttack || now < attacker.nextFireAt) {
         return false;
     }
 
@@ -399,6 +419,10 @@ bool processCombatInput(Player& attacker, std::vector<Player>& players, const ar
         range = KnifeRange;
         damage = KnifeDamage;
         attacker.nextFireAt = now + KnifeFireInterval;
+    } else if (attacker.equippedWeapon == WeaponSlot::LightningGun) {
+        range = LightningGunRange;
+        damage = LightningGunDamagePerTick;
+        attacker.nextFireAt = now + LightningGunTickInterval;
     } else {
         attacker.nextFireAt = now + ShotgunFireInterval;
     }
