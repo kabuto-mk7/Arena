@@ -31,7 +31,7 @@ constexpr float GravityScale = 1.18f;
 constexpr float JumpVelocityScale = 0.9f;
 constexpr float JumpStrafeAssist = 1.2f;
 constexpr float JumpBufferSeconds = 0.18f;
-constexpr int MaxHealth = 100;
+constexpr int MaxHealth = 10000;
 constexpr float ShotgunRange = 36.0f;
 constexpr int ShotgunDamage = 34;
 constexpr float ShotgunFireInterval = 0.24f;
@@ -68,6 +68,9 @@ struct Player {
     uint32_t lastHitTargetId = 0;
     double respawnAt = 0.0;
     double nextFireAt = 0.0;
+    double fireVisualUntil = 0.0;
+    double lgBeamUntil = 0.0;
+    arena::Vec3 lgBeamEnd{};
     double lastHeardAt = 0.0;
 };
 
@@ -402,7 +405,21 @@ bool processCombatInput(Player& attacker, std::vector<Player>& players, const ar
         wantsAttack = input.firePressed != 0;
     }
 
-    if (!wantsAttack || now < attacker.nextFireAt) {
+    if (!wantsAttack) {
+        return false;
+    }
+    if (attacker.equippedWeapon == WeaponSlot::LightningGun) {
+        const arena::Vec3 lgOrigin{
+            attacker.position.x,
+            attacker.position.y + eyeHeightForPlayer(attacker),
+            attacker.position.z
+        };
+        const arena::Vec3 lgDir = viewForward(attacker.yaw, attacker.pitch);
+        attacker.fireVisualUntil = now + 0.10;
+        attacker.lgBeamUntil = now + 0.10;
+        attacker.lgBeamEnd = lgOrigin + lgDir * LightningGunRange;
+    }
+    if (now < attacker.nextFireAt) {
         return false;
     }
 
@@ -419,12 +436,15 @@ bool processCombatInput(Player& attacker, std::vector<Player>& players, const ar
         range = KnifeRange;
         damage = KnifeDamage;
         attacker.nextFireAt = now + KnifeFireInterval;
+        attacker.fireVisualUntil = now + 0.08;
     } else if (attacker.equippedWeapon == WeaponSlot::LightningGun) {
         range = LightningGunRange;
         damage = LightningGunDamagePerTick;
         attacker.nextFireAt = now + LightningGunTickInterval;
+        attacker.fireVisualUntil = now + 0.10;
     } else {
         attacker.nextFireAt = now + ShotgunFireInterval;
+        attacker.fireVisualUntil = now + 0.10;
     }
 
     Player* bestTarget = nullptr;
@@ -484,6 +504,8 @@ void processRespawns(std::vector<Player>& players, double now) {
         player.jumpedSinceGround = false;
         player.airDashCharges = 0;
         player.dashBoostUntil = 0.0;
+        player.lgBeamUntil = 0.0;
+        player.lgBeamEnd = {};
         player.grounded = true;
 
         if (player.teamId == 1) {
@@ -553,11 +575,18 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
         hill.captureTeam = capturingTeam;
         hill.captureProgress = 1.0f;
     } else if (hill.ownerTeam != 0 && hill.ownerTeam != capturingTeam) {
-        hill.captureProgress = std::max(0.0f, hill.captureProgress - delta);
+        // Enemy is taking an owned point: first neutralize, then roll directly into recapture.
         hill.captureTeam = capturingTeam;
+        hill.captureProgress -= delta;
         if (hill.captureProgress <= 0.0f) {
+            const float overflow = -hill.captureProgress;
             hill.ownerTeam = 0;
-            hill.captureProgress = 0.0f;
+            hill.captureProgress = std::min(1.0f, overflow);
+            if (hill.captureProgress >= 1.0f) {
+                hill.ownerTeam = capturingTeam;
+                hill.captureTeam = capturingTeam;
+                hill.captureProgress = 1.0f;
+            }
         }
     } else {
         if (hill.captureTeam != capturingTeam) {
@@ -627,6 +656,7 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
     packet.hillWinnerTeam = hill.winnerTeam;
     packet.hillCaptureProgress = hill.captureProgress;
 
+    const double snapshotNow = arena::secondsNow();
     for (uint32_t i = 0; i < packet.playerCount; ++i) {
         packet.players[i].playerId = players[i].id;
         packet.players[i].x = players[i].position.x;
@@ -638,6 +668,12 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
         packet.players[i].teamId = players[i].teamId;
         packet.players[i].health = static_cast<uint8_t>(std::clamp(players[i].health, 0, MaxHealth));
         packet.players[i].dead = players[i].dead ? 1 : 0;
+        packet.players[i].weaponSlot = static_cast<uint8_t>(players[i].equippedWeapon);
+        packet.players[i].firing = (players[i].fireVisualUntil > snapshotNow) ? 1 : 0;
+        packet.players[i].lgBeamActive = (players[i].equippedWeapon == WeaponSlot::LightningGun && players[i].lgBeamUntil > snapshotNow) ? 1 : 0;
+        packet.players[i].lgBeamEndX = players[i].lgBeamEnd.x;
+        packet.players[i].lgBeamEndY = players[i].lgBeamEnd.y;
+        packet.players[i].lgBeamEndZ = players[i].lgBeamEnd.z;
         packet.players[i].hitConfirmCount = players[i].hitConfirmCount;
         packet.players[i].lastDamageDealt = players[i].lastDamageDealt;
         packet.players[i].lastHitTargetId = players[i].lastHitTargetId;

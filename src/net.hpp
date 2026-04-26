@@ -89,6 +89,12 @@ struct PlayerStatePacket {
     uint8_t teamId;
     uint8_t health;
     uint8_t dead;
+    uint8_t weaponSlot;
+    uint8_t firing;
+    uint8_t lgBeamActive;
+    float lgBeamEndX;
+    float lgBeamEndY;
+    float lgBeamEndZ;
     uint16_t hitConfirmCount;
     uint8_t lastDamageDealt;
     uint32_t lastHitTargetId;

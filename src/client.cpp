@@ -14,8 +14,8 @@
 
 namespace {
 
-constexpr int WindowWidth = 1920;
-constexpr int WindowHeight = 1080;
+constexpr int WindowWidth = 1280;
+constexpr int WindowHeight = 720;
 constexpr float DefaultMouseSensitivity = 0.0009f;
 constexpr float StepIntervalWalk = 0.37f;
 constexpr float StepIntervalCrouch = 0.52f;
@@ -29,6 +29,7 @@ constexpr double LightningGunStartupFrameDuration = 0.05;
 constexpr double LightningGunWinddownFrameDuration = 0.05;
 constexpr float LightningLoopFadeOutSeconds = 0.14f;
 constexpr float RecoilKickAmount = 18.0f;
+constexpr float WorldUnitsPerTextureTile = 10.0f;
 constexpr int MaxShells = 2;
 constexpr int MaxReserveAmmo = 32;
 constexpr int AmmoPickupAmount = 6;
@@ -41,8 +42,10 @@ enum class WeaponSlot : uint8_t {
 
 enum class WeaponAnimMode {
     Idle,
+    ShotgunEquip,
     ShotgunFire,
     ShotgunReload,
+    LightningGunEquip,
     LightningGunStartup,
     LightningGunFiring,
     LightningGunWinddown,
@@ -65,6 +68,10 @@ struct RemotePlayer {
     uint8_t teamId = 0;
     uint8_t health = 100;
     bool dead = false;
+    uint8_t weaponSlot = 1;
+    bool firing = false;
+    bool lgBeamActive = false;
+    arena::Vec3 lgBeamEnd{};
     uint16_t hitConfirmCount = 0;
     uint8_t lastDamageDealt = 0;
     uint32_t lastHitTargetId = 0;
@@ -191,6 +198,9 @@ struct ClientState {
     float hillCaptureProgress = 0.0f;
     std::vector<AmmoPack> ammoPacks;
     std::vector<DamagePopup> damagePopups;
+    std::map<uint32_t, uint8_t> enemyPrevFiring;
+    std::map<uint32_t, double> enemyNextFireSoundAt;
+    float damageFlash = 0.0f;
 };
 
 arena::Vec3 lerpVec3(arena::Vec3 a, arena::Vec3 b, float t) {
@@ -335,11 +345,15 @@ void initAssets(ClientState& state) {
     Mesh wallMeshX = GenMeshCube(0.2f, arena::RoomHeight, arena::RoomHalfSize * 2.0f);
     Mesh wallMeshZ = GenMeshCube(arena::RoomHalfSize * 2.0f, arena::RoomHeight, 0.2f);
 
-    // Tile textures across large surfaces so they repeat instead of stretching.
-    tileMeshUV(floorMesh, 16.0f, 16.0f);
-    tileMeshUV(ceilingMesh, 16.0f, 16.0f);
-    tileMeshUV(wallMeshX, 16.0f, 16.0f);
-    tileMeshUV(wallMeshZ, 16.0f, 16.0f);
+    // Tile using world-size-based UV scales so 128x128-style texels stay square on all surfaces.
+    const float roomSpan = arena::RoomHalfSize * 2.0f;
+    const float floorTiles = roomSpan / WorldUnitsPerTextureTile;
+    const float wallTilesU = roomSpan / WorldUnitsPerTextureTile;
+    const float wallTilesV = arena::RoomHeight / WorldUnitsPerTextureTile;
+    tileMeshUV(floorMesh, floorTiles, floorTiles);
+    tileMeshUV(ceilingMesh, floorTiles, floorTiles);
+    tileMeshUV(wallMeshX, wallTilesU, wallTilesV);
+    tileMeshUV(wallMeshZ, wallTilesU, wallTilesV);
 
     state.floorModel = LoadModelFromMesh(floorMesh);
     state.ceilingModel = LoadModelFromMesh(ceilingMesh);
@@ -560,8 +574,14 @@ void equipWeapon(ClientState& state, WeaponSlot slot, double now) {
         if (state.audioReady) {
             PlaySound(state.knifeEquip);
         }
+    } else if (slot == WeaponSlot::LightningGun) {
+        state.weaponAnimMode = WeaponAnimMode::LightningGunEquip;
+        state.weaponAnimStartAt = now;
+        state.nextWeaponActionAt = now + KnifeEquipSlideDuration;
     } else {
-        state.weaponAnimMode = WeaponAnimMode::Idle;
+        state.weaponAnimMode = WeaponAnimMode::ShotgunEquip;
+        state.weaponAnimStartAt = now;
+        state.nextWeaponActionAt = now + KnifeEquipSlideDuration;
     }
 }
 
@@ -850,6 +870,7 @@ void pumpNetwork(ClientState& state) {
 
             std::map<uint32_t, RemotePlayer> nextPlayers;
             const uint32_t count = std::min<uint32_t>(packet.playerCount, arena::MaxPlayers);
+            const double now = arena::secondsNow();
             for (uint32_t i = 0; i < count; ++i) {
                 RemotePlayer player{};
                 player.position = {packet.players[i].x, packet.players[i].y, packet.players[i].z};
@@ -859,12 +880,51 @@ void pumpNetwork(ClientState& state) {
                 player.teamId = packet.players[i].teamId;
                 player.health = packet.players[i].health;
                 player.dead = packet.players[i].dead != 0;
+                player.weaponSlot = packet.players[i].weaponSlot;
+                player.firing = packet.players[i].firing != 0;
+                player.lgBeamActive = packet.players[i].lgBeamActive != 0;
+                player.lgBeamEnd = {packet.players[i].lgBeamEndX, packet.players[i].lgBeamEndY, packet.players[i].lgBeamEndZ};
                 player.hitConfirmCount = packet.players[i].hitConfirmCount;
                 player.lastDamageDealt = packet.players[i].lastDamageDealt;
                 player.lastHitTargetId = packet.players[i].lastHitTargetId;
+                if (packet.players[i].playerId != state.localPlayerId && player.firing && state.audioReady) {
+                    const uint8_t prevFiring = state.enemyPrevFiring[packet.players[i].playerId];
+                    const bool risingEdge = prevFiring == 0;
+                    if (player.weaponSlot == static_cast<uint8_t>(WeaponSlot::Shotgun)) {
+                        if (risingEdge) {
+                            PlaySound(state.shotgunFire);
+                        }
+                    } else if (player.weaponSlot == static_cast<uint8_t>(WeaponSlot::LightningGun) && state.lightningAudioLoaded) {
+                        double& nextAt = state.enemyNextFireSoundAt[packet.players[i].playerId];
+                        if (risingEdge || now >= nextAt) {
+                            Sound& s = nextAliasOrBase(
+                                state.lightningFireStart,
+                                state.lightningFireStartAliases,
+                                state.lightningFireStartAliasCount,
+                                state.lightningFireStartAliasNext);
+                            PlaySound(s);
+                            nextAt = now + 0.11;
+                        }
+                    }
+                }
+                state.enemyPrevFiring[packet.players[i].playerId] = player.firing ? 1 : 0;
                 nextPlayers[packet.players[i].playerId] = player;
             }
             state.players = std::move(nextPlayers);
+            for (auto itF = state.enemyPrevFiring.begin(); itF != state.enemyPrevFiring.end();) {
+                if (state.players.find(itF->first) == state.players.end()) {
+                    itF = state.enemyPrevFiring.erase(itF);
+                } else {
+                    ++itF;
+                }
+            }
+            for (auto itS = state.enemyNextFireSoundAt.begin(); itS != state.enemyNextFireSoundAt.end();) {
+                if (state.players.find(itS->first) == state.players.end()) {
+                    itS = state.enemyNextFireSoundAt.erase(itS);
+                } else {
+                    ++itS;
+                }
+            }
             state.team1TimeLeftSeconds = packet.team1TimeLeftSeconds;
             state.team2TimeLeftSeconds = packet.team2TimeLeftSeconds;
             state.hillOwnerTeam = packet.hillOwnerTeam;
@@ -880,11 +940,15 @@ void pumpNetwork(ClientState& state) {
 void syncLocalPosition(ClientState& state) {
     const auto it = state.players.find(state.localPlayerId);
     if (it != state.players.end()) {
+        const uint8_t previousHealth = state.localHealth;
         state.localPosition = it->second.position;
         state.localCrouched = it->second.crouched;
         state.localTeamId = it->second.teamId;
         state.localHealth = it->second.health;
         state.localDead = it->second.dead;
+        if (state.localHealth < previousHealth) {
+            state.damageFlash = 1.0f;
+        }
         if (state.localHitConfirmInitialized && it->second.hitConfirmCount != state.localHitConfirmCount &&
             state.hitSoundEnabled && state.hitSoundLoaded && state.audioReady) {
             const uint16_t delta = static_cast<uint16_t>(it->second.hitConfirmCount - state.localHitConfirmCount);
@@ -954,6 +1018,47 @@ void updateDamagePopups(ClientState& state, float dt) {
         state.damagePopups.end());
 }
 
+void drawKothTestMapGeometry() {
+    const Color groundA{118, 110, 96, 255};
+    const Color groundB{102, 96, 86, 255};
+    const Color coverA{120, 128, 138, 255};
+    const Color coverB{92, 98, 108, 255};
+    const Color accent{160, 170, 186, 255};
+
+    // Soft terrain variation around the hill.
+    DrawCube({0.0f, 0.18f, 0.0f}, 26.0f, 0.36f, 26.0f, groundA);
+    DrawCube({-13.0f, 0.14f, -13.0f}, 14.0f, 0.28f, 14.0f, groundB);
+    DrawCube({13.0f, 0.14f, -13.0f}, 14.0f, 0.28f, 14.0f, groundB);
+    DrawCube({-13.0f, 0.14f, 13.0f}, 14.0f, 0.28f, 14.0f, groundB);
+    DrawCube({13.0f, 0.14f, 13.0f}, 14.0f, 0.28f, 14.0f, groundB);
+
+    // Mid cover blocks around point.
+    DrawCube({-8.0f, 1.15f, 0.0f}, 2.0f, 2.3f, 6.4f, coverA);
+    DrawCube({8.0f, 1.15f, 0.0f}, 2.0f, 2.3f, 6.4f, coverA);
+    DrawCube({0.0f, 1.15f, -8.0f}, 6.4f, 2.3f, 2.0f, coverA);
+    DrawCube({0.0f, 1.15f, 8.0f}, 6.4f, 2.3f, 2.0f, coverA);
+    DrawCubeWires({-8.0f, 1.15f, 0.0f}, 2.0f, 2.3f, 6.4f, accent);
+    DrawCubeWires({8.0f, 1.15f, 0.0f}, 2.0f, 2.3f, 6.4f, accent);
+    DrawCubeWires({0.0f, 1.15f, -8.0f}, 6.4f, 2.3f, 2.0f, accent);
+    DrawCubeWires({0.0f, 1.15f, 8.0f}, 6.4f, 2.3f, 2.0f, accent);
+
+    // Outer lane structures.
+    DrawCube({-24.0f, 2.0f, -22.0f}, 6.0f, 4.0f, 6.0f, coverB);
+    DrawCube({24.0f, 2.0f, -22.0f}, 6.0f, 4.0f, 6.0f, coverB);
+    DrawCube({-24.0f, 2.0f, 22.0f}, 6.0f, 4.0f, 6.0f, coverB);
+    DrawCube({24.0f, 2.0f, 22.0f}, 6.0f, 4.0f, 6.0f, coverB);
+    DrawCubeWires({-24.0f, 2.0f, -22.0f}, 6.0f, 4.0f, 6.0f, accent);
+    DrawCubeWires({24.0f, 2.0f, -22.0f}, 6.0f, 4.0f, 6.0f, accent);
+    DrawCubeWires({-24.0f, 2.0f, 22.0f}, 6.0f, 4.0f, 6.0f, accent);
+    DrawCubeWires({24.0f, 2.0f, 22.0f}, 6.0f, 4.0f, 6.0f, accent);
+
+    // Spawn side lane dividers.
+    DrawCube({-38.0f, 1.35f, -10.0f}, 2.0f, 2.7f, 12.0f, coverB);
+    DrawCube({38.0f, 1.35f, 10.0f}, 2.0f, 2.7f, 12.0f, coverB);
+    DrawCubeWires({-38.0f, 1.35f, -10.0f}, 2.0f, 2.7f, 12.0f, accent);
+    DrawCubeWires({38.0f, 1.35f, 10.0f}, 2.0f, 2.7f, 12.0f, accent);
+}
+
 void drawRoom(const ClientState& state) {
     constexpr float half = arena::RoomHalfSize;
     constexpr float height = arena::RoomHeight;
@@ -966,6 +1071,8 @@ void drawRoom(const ClientState& state) {
     DrawModel(state.wallModelX, {half + thickness * 0.5f, height * 0.5f, 0.0f}, 1.0f, WHITE);
     DrawModel(state.wallModelZ, {0.0f, height * 0.5f, -half - thickness * 0.5f}, 1.0f, WHITE);
     DrawModel(state.wallModelZ, {0.0f, height * 0.5f, half + thickness * 0.5f}, 1.0f, WHITE);
+
+    drawKothTestMapGeometry();
 
     DrawGrid(32, 5.0f);
 
@@ -1006,6 +1113,68 @@ void drawPlayerCapsule(const RemotePlayer& player) {
     const Vector3 eye{feet.x, feet.y + eyeHeight, feet.z};
     const Vector3 facing = cameraForward(player.yaw, player.pitch);
     DrawLine3D(eye, Vector3Add(eye, Vector3Scale(facing, 1.2f)), outline);
+
+}
+
+void drawRemoteWeaponProxy(const RemotePlayer& player) {
+    if (player.dead) {
+        return;
+    }
+
+    const float eyeHeight = player.crouched ? arena::CrouchEyeHeight : arena::StandEyeHeight;
+    const Vector3 eye{player.position.x, player.position.y + eyeHeight, player.position.z};
+    const Vector3 forward = cameraForward(player.yaw, player.pitch);
+    // Keep proxy centered on the same axis used by server raycast: eye + forward.
+    const Vector3 grip = Vector3Add(eye, Vector3Scale(forward, 0.22f));
+
+    if (player.weaponSlot == static_cast<uint8_t>(WeaponSlot::Knife)) {
+        const Vector3 handleEnd = Vector3Add(grip, Vector3Scale(forward, 0.18f));
+        const Vector3 bladeEnd = Vector3Add(handleEnd, Vector3Scale(forward, 0.46f));
+        DrawCylinderEx(grip, handleEnd, 0.045f, 0.045f, 8, Color{62, 66, 78, 255});
+        DrawCylinderEx(handleEnd, bladeEnd, 0.024f, 0.012f, 8, Color{205, 215, 225, 255});
+        if (player.firing) {
+            DrawLine3D(handleEnd, Vector3Add(bladeEnd, Vector3{0.0f, 0.06f, 0.0f}), Color{255, 195, 165, 230});
+        }
+        return;
+    }
+
+    if (player.weaponSlot == static_cast<uint8_t>(WeaponSlot::LightningGun)) {
+        const Vector3 bodyEnd = Vector3Add(grip, Vector3Scale(forward, 0.56f));
+        const Vector3 muzzle = Vector3Add(bodyEnd, Vector3Scale(forward, 0.30f));
+        DrawCylinderEx(grip, bodyEnd, 0.062f, 0.058f, 10, Color{78, 90, 98, 255});
+        DrawCylinderEx(bodyEnd, muzzle, 0.040f, 0.032f, 10, Color{95, 112, 122, 255});
+        DrawSphere(muzzle, 0.045f, Color{108, 238, 238, 230});
+        if (player.firing) {
+            DrawSphere(muzzle, 0.07f, Color{180, 255, 250, 200});
+        }
+        return;
+    }
+
+    const Vector3 bodyEnd = Vector3Add(grip, Vector3Scale(forward, 0.62f));
+    const Vector3 muzzle = Vector3Add(bodyEnd, Vector3Scale(forward, 0.32f));
+    DrawCylinderEx(grip, bodyEnd, 0.068f, 0.062f, 10, Color{80, 78, 74, 255});
+    DrawCylinderEx(bodyEnd, muzzle, 0.046f, 0.038f, 10, Color{108, 102, 95, 255});
+    if (player.firing) {
+        DrawSphere(muzzle, 0.10f, Color{255, 210, 135, 225});
+        DrawLine3D(muzzle, Vector3Add(muzzle, Vector3Scale(forward, 1.2f)), Color{255, 215, 140, 210});
+    }
+}
+
+void drawRemoteServerLightningBeams(const ClientState& state) {
+    for (const auto& [id, player] : state.players) {
+        if (id == state.localPlayerId || player.dead) {
+            continue;
+        }
+        if (player.weaponSlot != static_cast<uint8_t>(WeaponSlot::LightningGun) || !player.lgBeamActive) {
+            continue;
+        }
+        const float eyeHeight = player.crouched ? arena::CrouchEyeHeight : arena::StandEyeHeight;
+        const Vector3 start{player.position.x, player.position.y + eyeHeight, player.position.z};
+        const Vector3 end{player.lgBeamEnd.x, player.lgBeamEnd.y, player.lgBeamEnd.z};
+        DrawLine3D(start, end, Color{132, 255, 246, 220});
+        DrawSphere(start, 0.08f, Color{170, 255, 248, 220});
+        DrawSphere(end, 0.09f, Color{190, 255, 250, 200});
+    }
 }
 
 void updateViewmodelAndFootsteps(ClientState& state, double now, float dt) {
@@ -1144,7 +1313,7 @@ int weaponFrameIndex(const ClientState& state, double now) {
         return -1;
     }
     constexpr int idleFrame = 0;
-    if (state.weaponAnimMode == WeaponAnimMode::Idle || state.weaponAnimMode == WeaponAnimMode::ShotgunFire) {
+    if (state.weaponAnimMode == WeaponAnimMode::Idle || state.weaponAnimMode == WeaponAnimMode::ShotgunFire || state.weaponAnimMode == WeaponAnimMode::ShotgunEquip) {
         return idleFrame;
     }
     static const std::array<int, 7> reloadSequence = {1, 2, 3, 4, 5, 6, 7};
@@ -1154,6 +1323,13 @@ int weaponFrameIndex(const ClientState& state, double now) {
 
 void updateWeaponAnimationState(ClientState& state, double now) {
     if (state.weaponAnimMode == WeaponAnimMode::Idle) {
+        return;
+    }
+
+    if (state.weaponAnimMode == WeaponAnimMode::ShotgunEquip || state.weaponAnimMode == WeaponAnimMode::LightningGunEquip) {
+        if (now - state.weaponAnimStartAt >= KnifeEquipSlideDuration) {
+            state.weaponAnimMode = WeaponAnimMode::Idle;
+        }
         return;
     }
 
@@ -1258,6 +1434,8 @@ void drawViewmodel(const ClientState& state, double now) {
             frame = &state.lightningGunStartupFrames[index];
         } else if (state.weaponAnimMode == WeaponAnimMode::LightningGunFiring) {
             frame = &state.lightningGunFiring;
+        } else if (state.weaponAnimMode == WeaponAnimMode::LightningGunEquip) {
+            frame = &state.lightningGunIdle;
         } else if (state.weaponAnimMode == WeaponAnimMode::LightningGunWinddown) {
             const int step = static_cast<int>((now - state.weaponAnimStartAt) / LightningGunWinddownFrameDuration);
             const int reverseIndex = (state.lightningGunStartupFrameCount - 1) - std::clamp(step, 0, state.lightningGunStartupFrameCount - 1);
@@ -1301,7 +1479,10 @@ void drawViewmodel(const ClientState& state, double now) {
     const float bobY = std::sin(state.weaponBobPhase) * (knifeEquipped ? 6.0f : 8.0f);
     const float recoilY = (knifeEquipped || lgEquipped) ? 0.0f : state.recoilOffset;
     float equipSlideY = 0.0f;
-    if (knifeEquipped && state.weaponAnimMode == WeaponAnimMode::KnifeEquip) {
+    const bool equipSliding = state.weaponAnimMode == WeaponAnimMode::KnifeEquip ||
+        state.weaponAnimMode == WeaponAnimMode::ShotgunEquip ||
+        state.weaponAnimMode == WeaponAnimMode::LightningGunEquip;
+    if (equipSliding) {
         const float t = std::clamp(static_cast<float>((now - state.weaponAnimStartAt) / KnifeEquipSlideDuration), 0.0f, 1.0f);
         equipSlideY = (1.0f - t) * (drawHeight + 80.0f);
     }
@@ -1425,7 +1606,9 @@ void render(ClientState& state, double now) {
             continue;
         }
         drawPlayerCapsule(player);
+        drawRemoteWeaponProxy(player);
     }
+    drawRemoteServerLightningBeams(state);
 
     EndMode3D();
     drawLightningBeamVfx(state, now);
@@ -1444,11 +1627,17 @@ void render(ClientState& state, double now) {
     }
     drawViewmodel(state, now);
 
+    if (state.damageFlash > 0.001f) {
+        const unsigned char alpha = static_cast<unsigned char>(std::clamp(state.damageFlash, 0.0f, 1.0f) * 125.0f);
+        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{210, 42, 42, alpha});
+    }
+
     const int cx = GetScreenWidth() / 2;
     const int cy = GetScreenHeight() / 2;
     DrawLine(cx - 8, cy, cx + 8, cy, RED);
     DrawLine(cx, cy - 8, cx, cy + 8, RED);
-    DrawText(TextFormat("%.1f u/s", state.currentSpeed), cx + 14, cy + 14, 20, Color{225, 232, 245, 255});
+    const float displaySpeedUnits = state.currentSpeed * 100.0f;
+    DrawText(TextFormat("%.0f u/s", displaySpeedUnits), cx + 14, cy + 14, 20, Color{225, 232, 245, 255});
 
     const std::string status = state.connected
         ? "Connected as player " + std::to_string(state.localPlayerId) + " | players: " + std::to_string(state.players.size())
@@ -1508,10 +1697,9 @@ int main(int argc, char** argv) {
         }
         arena::makeNonBlocking(state.socket);
 
-        SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_UNDECORATED);
+        SetConfigFlags(FLAG_MSAA_4X_HINT);
         InitWindow(WindowWidth, WindowHeight, "KOTH");
         SetExitKey(KEY_NULL);
-        SetWindowPosition(0, 0);
         EnableCursor();
         state.mainMenuOpenedAt = GetTime();
         initAssets(state);
@@ -1619,6 +1807,7 @@ int main(int argc, char** argv) {
             pumpNetwork(state);
             syncLocalPosition(state);
             updateSmoothedRenderPosition(state, dt);
+            state.damageFlash = std::max(0.0f, state.damageFlash - dt * 2.8f);
             updateSpeedCounter(state, dt);
             updateDamagePopups(state, dt);
             updateViewmodelAndFootsteps(state, now, dt);
