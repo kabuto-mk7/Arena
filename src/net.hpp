@@ -26,6 +26,8 @@ namespace arena {
 constexpr uint32_t ProtocolMagic = 0x41524650; // ARFP
 constexpr uint16_t DefaultPort = 40000;
 constexpr int MaxPlayers = 32;
+constexpr int MapMaxWidth = 32;
+constexpr int MapMaxHeight = 32;
 constexpr float TickSeconds = 1.0f / 60.0f;
 constexpr float RoomHalfSize = 80.0f;
 constexpr float RoomHeight = 18.0f;
@@ -44,6 +46,7 @@ enum class PacketType : uint8_t {
     Input = 2,
     Welcome = 3,
     Snapshot = 4,
+    MapData = 5,
 };
 
 #pragma pack(push, 1)
@@ -76,6 +79,16 @@ struct InputPacket {
 struct WelcomePacket {
     PacketHeader header;
     uint32_t playerId;
+};
+
+struct MapDataPacket {
+    PacketHeader header;
+    uint16_t width;
+    uint16_t height;
+    float cellSize;
+    float originX;
+    float originZ;
+    char cells[MapMaxWidth * MapMaxHeight];
 };
 
 struct PlayerStatePacket {

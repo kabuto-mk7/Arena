@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -201,6 +202,13 @@ struct ClientState {
     std::map<uint32_t, uint8_t> enemyPrevFiring;
     std::map<uint32_t, double> enemyNextFireSoundAt;
     float damageFlash = 0.0f;
+    bool mapLoaded = false;
+    uint16_t mapWidth = 0;
+    uint16_t mapHeight = 0;
+    float mapCellSize = 4.0f;
+    float mapOriginX = 0.0f;
+    float mapOriginZ = 0.0f;
+    std::array<char, arena::MapMaxWidth * arena::MapMaxHeight> mapCells{};
 };
 
 arena::Vec3 lerpVec3(arena::Vec3 a, arena::Vec3 b, float t) {
@@ -863,6 +871,16 @@ void pumpNetwork(ClientState& state) {
             std::memcpy(&packet, buffer, sizeof(packet));
             state.localPlayerId = packet.playerId;
             state.connected = true;
+        } else if (received == sizeof(arena::MapDataPacket) && arena::hasValidHeader(buffer, received, arena::PacketType::MapData)) {
+            arena::MapDataPacket packet{};
+            std::memcpy(&packet, buffer, sizeof(packet));
+            state.mapWidth = std::min<uint16_t>(packet.width, arena::MapMaxWidth);
+            state.mapHeight = std::min<uint16_t>(packet.height, arena::MapMaxHeight);
+            state.mapCellSize = packet.cellSize;
+            state.mapOriginX = packet.originX;
+            state.mapOriginZ = packet.originZ;
+            std::memcpy(state.mapCells.data(), packet.cells, sizeof(packet.cells));
+            state.mapLoaded = true;
         } else if (received >= static_cast<int>(sizeof(arena::PacketHeader) + sizeof(uint32_t) * 2) &&
                    arena::hasValidHeader(buffer, received, arena::PacketType::Snapshot)) {
             arena::SnapshotPacket packet{};
@@ -1018,37 +1036,34 @@ void updateDamagePopups(ClientState& state, float dt) {
         state.damagePopups.end());
 }
 
-void drawKothTestMapGeometry() {
+void drawKothTestMapGeometry(const ClientState& state) {
     const Color block{102, 108, 116, 255};
-    const Color ramp{112, 98, 86, 255};
+    const Color ramp{118, 104, 90, 255};
     const Color wire{168, 176, 190, 220};
+    if (!state.mapLoaded || state.mapWidth == 0 || state.mapHeight == 0) {
+        return;
+    }
 
-    const auto drawSolid = [&](Vector3 c, Vector3 s, Color col) {
-        DrawCube(c, s.x, s.y, s.z, col);
-        DrawCubeWires(c, s.x, s.y, s.z, wire);
-    };
-
-    // Sight-blocking core around point.
-    drawSolid({0.0f, 1.0f, 0.0f}, {4.0f, 2.0f, 20.0f}, block);
-    drawSolid({0.0f, 1.0f, 0.0f}, {20.0f, 2.0f, 4.0f}, block);
-    drawSolid({-12.0f, 0.6f, 0.0f}, {4.0f, 1.2f, 8.0f}, block);
-    drawSolid({12.0f, 0.6f, 0.0f}, {4.0f, 1.2f, 8.0f}, block);
-    drawSolid({0.0f, 0.6f, -12.0f}, {8.0f, 1.2f, 4.0f}, block);
-    drawSolid({0.0f, 0.6f, 12.0f}, {8.0f, 1.2f, 4.0f}, block);
-
-    // Outer blockers.
-    drawSolid({-24.0f, 1.4f, -16.0f}, {6.0f, 2.8f, 6.0f}, block);
-    drawSolid({24.0f, 1.4f, -16.0f}, {6.0f, 2.8f, 6.0f}, block);
-    drawSolid({-24.0f, 1.4f, 16.0f}, {6.0f, 2.8f, 6.0f}, block);
-    drawSolid({24.0f, 1.4f, 16.0f}, {6.0f, 2.8f, 6.0f}, block);
-
-    // Ramps / approach steps.
-    drawSolid({-8.5f, 0.2f, 0.0f}, {3.0f, 0.4f, 7.0f}, ramp);
-    drawSolid({-5.4f, 0.5f, 0.0f}, {3.0f, 0.6f, 7.0f}, ramp);
-    drawSolid({8.5f, 0.2f, 0.0f}, {3.0f, 0.4f, 7.0f}, ramp);
-    drawSolid({5.4f, 0.5f, 0.0f}, {3.0f, 0.6f, 7.0f}, ramp);
-    drawSolid({0.0f, 0.2f, -8.5f}, {7.0f, 0.4f, 3.0f}, ramp);
-    drawSolid({0.0f, 0.2f, 8.5f}, {7.0f, 0.4f, 3.0f}, ramp);
+    for (uint16_t z = 0; z < state.mapHeight; ++z) {
+        for (uint16_t x = 0; x < state.mapWidth; ++x) {
+            const char symbol = state.mapCells[z * arena::MapMaxWidth + x];
+            float h = 0.0f;
+            Color c = block;
+            if (symbol == 'B') {
+                h = 5.0f;
+            } else if (symbol == 'R') {
+                h = 2.0f;
+                c = ramp;
+            }
+            if (h <= 0.0f) {
+                continue;
+            }
+            const float cx = state.mapOriginX + static_cast<float>(x) * state.mapCellSize;
+            const float cz = state.mapOriginZ + static_cast<float>(z) * state.mapCellSize;
+            DrawCube({cx, h * 0.5f, cz}, state.mapCellSize * 0.95f, h, state.mapCellSize * 0.95f, c);
+            DrawCubeWires({cx, h * 0.5f, cz}, state.mapCellSize * 0.95f, h, state.mapCellSize * 0.95f, wire);
+        }
+    }
 }
 
 void drawRoom(const ClientState& state) {
@@ -1064,7 +1079,7 @@ void drawRoom(const ClientState& state) {
     DrawModel(state.wallModelZ, {0.0f, height * 0.5f, -half - thickness * 0.5f}, 1.0f, WHITE);
     DrawModel(state.wallModelZ, {0.0f, height * 0.5f, half + thickness * 0.5f}, 1.0f, WHITE);
 
-    drawKothTestMapGeometry();
+    drawKothTestMapGeometry(state);
 
     DrawGrid(32, 5.0f);
 

@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -49,26 +51,71 @@ struct StaticSolid {
     arena::Vec3 size{};
 };
 
-const std::array<StaticSolid, 16>& mapSolids() {
-    static const std::array<StaticSolid, 16> solids{{
-        {{0.0f, 1.0f, 0.0f}, {4.0f, 2.0f, 20.0f}},
-        {{0.0f, 1.0f, 0.0f}, {20.0f, 2.0f, 4.0f}},
-        {{-12.0f, 0.6f, 0.0f}, {4.0f, 1.2f, 8.0f}},
-        {{12.0f, 0.6f, 0.0f}, {4.0f, 1.2f, 8.0f}},
-        {{0.0f, 0.6f, -12.0f}, {8.0f, 1.2f, 4.0f}},
-        {{0.0f, 0.6f, 12.0f}, {8.0f, 1.2f, 4.0f}},
-        {{-24.0f, 1.4f, -16.0f}, {6.0f, 2.8f, 6.0f}},
-        {{24.0f, 1.4f, -16.0f}, {6.0f, 2.8f, 6.0f}},
-        {{-24.0f, 1.4f, 16.0f}, {6.0f, 2.8f, 6.0f}},
-        {{24.0f, 1.4f, 16.0f}, {6.0f, 2.8f, 6.0f}},
-        {{-8.5f, 0.2f, 0.0f}, {3.0f, 0.4f, 7.0f}},
-        {{-5.4f, 0.5f, 0.0f}, {3.0f, 0.6f, 7.0f}},
-        {{8.5f, 0.2f, 0.0f}, {3.0f, 0.4f, 7.0f}},
-        {{5.4f, 0.5f, 0.0f}, {3.0f, 0.6f, 7.0f}},
-        {{0.0f, 0.2f, -8.5f}, {7.0f, 0.4f, 3.0f}},
-        {{0.0f, 0.2f, 8.5f}, {7.0f, 0.4f, 3.0f}},
+struct ServerMap {
+    uint16_t width = 0;
+    uint16_t height = 0;
+    float cellSize = 4.0f;
+    float originX = 0.0f;
+    float originZ = 0.0f;
+    std::array<char, arena::MapMaxWidth * arena::MapMaxHeight> cells{};
+    std::vector<StaticSolid> solids;
+};
+
+ServerMap& worldMap() {
+    static ServerMap map{};
+    static bool initialized = false;
+    if (initialized) {
+        return map;
+    }
+    initialized = true;
+    // Map legend:
+    // '.' = empty
+    // 'B' = big sight-blocking solid
+    // 'R' = low solid that can be stood on and shot over, but still blocks movement and sight at lower heights
+    // 'C' = capture point center (not treated specially by server, just for map authoring reference)
+    // kill myself
+    static const std::array<const char*, 13> ascii = {{
+        ".............",
+        ".............",
+        ".....BBB.....",
+        ".............",
+        ".............",
+        ".............",
+        "......C....a.",
+        ".............",
+        ".............",
+        "...B..R..B...",
+        ".............",
+        ".............",
+        ".............",
     }};
-    return solids;
+
+    map.width = static_cast<uint16_t>(ascii[0] ? std::char_traits<char>::length(ascii[0]) : 0);
+    map.height = static_cast<uint16_t>(ascii.size());
+    map.cellSize = 4.0f;
+    map.originX = -0.5f * static_cast<float>(map.width - 1) * map.cellSize;
+    map.originZ = -0.5f * static_cast<float>(map.height - 1) * map.cellSize;
+    map.cells.fill('.');
+
+    for (uint16_t z = 0; z < map.height; ++z) {
+        for (uint16_t x = 0; x < map.width; ++x) {
+            const char symbol = ascii[z][x];
+            map.cells[z * arena::MapMaxWidth + x] = symbol;
+            float solidHeight = 0.0f;
+            switch (symbol) {
+            case 'B': solidHeight = 5.0f; break;   // Big sight blocker
+            case 'R': solidHeight = 2.0f; break;   // Ramp/low block
+            default: break;
+            }
+            if (solidHeight <= 0.0f) {
+                continue;
+            }
+            const float cx = map.originX + static_cast<float>(x) * map.cellSize;
+            const float cz = map.originZ + static_cast<float>(z) * map.cellSize;
+            map.solids.push_back({{cx, solidHeight * 0.5f, cz}, {map.cellSize * 0.95f, solidHeight, map.cellSize * 0.95f}});
+        }
+    }
+    return map;
 }
 
 bool horizontalCircleOverlapsBox(const arena::Vec3& pos, float radius, const StaticSolid& s) {
@@ -90,7 +137,7 @@ void resolveHorizontalMapCollisions(arena::Vec3& position, arena::Vec3& velocity
 
     for (int iter = 0; iter < 3; ++iter) {
         bool resolvedAny = false;
-        for (const StaticSolid& s : mapSolids()) {
+        for (const StaticSolid& s : worldMap().solids) {
             const float minY = s.center.y - s.size.y * 0.5f;
             const float maxY = s.center.y + s.size.y * 0.5f;
             if (playerTop <= minY || playerBottom >= maxY) {
@@ -138,7 +185,7 @@ void resolveHorizontalMapCollisions(arena::Vec3& position, arena::Vec3& velocity
 bool resolveVerticalMapCollisions(arena::Vec3& position, float& velocityY, float prevY, float currentHeight) {
     bool landed = false;
     const float radius = arena::PlayerRadius;
-    for (const StaticSolid& s : mapSolids()) {
+    for (const StaticSolid& s : worldMap().solids) {
         if (!horizontalCircleOverlapsBox(position, radius, s)) {
             continue;
         }
@@ -191,6 +238,7 @@ struct Player {
     double lgBeamUntil = 0.0;
     arena::Vec3 lgBeamEnd{};
     double lastHeardAt = 0.0;
+    bool mapSent = false;
 };
 
 struct HillState {
@@ -351,6 +399,26 @@ void sendWelcome(SOCKET socket, const Player& player) {
     arena::WelcomePacket packet{};
     packet.header = arena::makeHeader(arena::PacketType::Welcome);
     packet.playerId = player.id;
+
+    sendto(
+        socket,
+        reinterpret_cast<const char*>(&packet),
+        sizeof(packet),
+        0,
+        reinterpret_cast<const sockaddr*>(&player.address),
+        sizeof(player.address));
+}
+
+void sendMapData(SOCKET socket, const Player& player) {
+    const ServerMap& map = worldMap();
+    arena::MapDataPacket packet{};
+    packet.header = arena::makeHeader(arena::PacketType::MapData);
+    packet.width = map.width;
+    packet.height = map.height;
+    packet.cellSize = map.cellSize;
+    packet.originX = map.originX;
+    packet.originZ = map.originZ;
+    std::memcpy(packet.cells, map.cells.data(), sizeof(packet.cells));
 
     sendto(
         socket,
@@ -557,7 +625,7 @@ bool rayIntersectsAabb(const arena::Vec3& origin, const arena::Vec3& dir, float 
 
 float firstWorldBlockerDistance(const arena::Vec3& origin, const arena::Vec3& dir, float maxDistance) {
     float best = maxDistance + 1.0f;
-    for (const StaticSolid& s : mapSolids()) {
+    for (const StaticSolid& s : worldMap().solids) {
         float t = 0.0f;
         if (rayIntersectsAabb(origin, dir, maxDistance, s, t) && t < best) {
             best = t;
@@ -942,6 +1010,10 @@ int main(int argc, char** argv) {
                     }
                     if (existing != nullptr) {
                         sendWelcome(socket, *existing);
+                        if (!existing->mapSent) {
+                            sendMapData(socket, *existing);
+                            existing->mapSent = true;
+                        }
                     }
                 } else if (received == sizeof(arena::InputPacket) && arena::hasValidHeader(buffer, received, arena::PacketType::Input)) {
                     arena::InputPacket input{};
