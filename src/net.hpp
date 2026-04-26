@@ -67,6 +67,9 @@ struct InputPacket {
     uint8_t crouchHeld;
     uint8_t weaponSlot;
     uint8_t firePressed;
+    uint8_t dashPressed;
+    int8_t dashMoveX;
+    int8_t dashMoveZ;
 };
 
 struct WelcomePacket {
@@ -85,17 +88,22 @@ struct PlayerStatePacket {
     uint8_t teamId;
     uint8_t health;
     uint8_t dead;
+    uint16_t hitConfirmCount;
+    uint8_t lastDamageDealt;
+    uint32_t lastHitTargetId;
 };
 
 struct SnapshotPacket {
     PacketHeader header;
     uint32_t serverTick;
     uint32_t playerCount;
-    uint16_t team1Score;
-    uint16_t team2Score;
+    uint16_t team1TimeLeftSeconds;
+    uint16_t team2TimeLeftSeconds;
     uint8_t hillOwnerTeam;
     uint8_t hillCaptureTeam;
     uint8_t hillContested;
+    uint8_t hillOvertime;
+    uint8_t hillWinnerTeam;
     float hillCaptureProgress;
     PlayerStatePacket players[MaxPlayers];
 };

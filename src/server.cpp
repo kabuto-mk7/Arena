@@ -16,12 +16,20 @@ enum class WeaponSlot : uint8_t {
 constexpr float BaseMoveSpeed = 8.9f;
 constexpr float KnifeSpeedMultiplier = 1.2f;
 constexpr float KnifeJumpMultiplier = 1.08f;
-constexpr float SvAccelerate = 10.0f;
-constexpr float SvAirAccelerate = 6.0f;
-constexpr float SvFriction = 4.0f;
-constexpr float SvStopSpeed = 2.8f;
-constexpr float SvAirSpeedCap = 2.2f;
+constexpr float SvAccelerate = 12.0f;
+constexpr float SvAirAccelerate = 5.0f;
+constexpr float SvFriction = 7.0f;
+constexpr float SvStopSpeed = 8.0f;
+constexpr float SvAirSpeedCap = 2.0f;
 constexpr float MaxBhopSpeedFactor = 1.45f;
+constexpr float AirDashImpulse = 18.5f;
+constexpr float AirDashMaxSpeed = 26.0f;
+constexpr float AirDashBoostDuration = 0.075f;
+constexpr float AirDashBoostSpeedFactor = 2.2f;
+constexpr float GravityScale = 1.18f;
+constexpr float JumpVelocityScale = 0.9f;
+constexpr float JumpStrafeAssist = 1.2f;
+constexpr float JumpBufferSeconds = 0.18f;
 constexpr int MaxHealth = 100;
 constexpr float ShotgunRange = 36.0f;
 constexpr int ShotgunDamage = 34;
@@ -42,11 +50,18 @@ struct Player {
     bool grounded = true;
     bool crouched = false;
     bool wasForwardHeld = false;
+    bool jumpedSinceGround = false;
+    int airDashCharges = 0;
+    double dashBoostUntil = 0.0;
+    double jumpBufferedUntil = 0.0;
     uint8_t teamId = 1;
     WeaponSlot equippedWeapon = WeaponSlot::Knife;
     float airborneSpeedMultiplier = 1.0f;
     int health = MaxHealth;
     bool dead = false;
+    uint16_t hitConfirmCount = 0;
+    uint8_t lastDamageDealt = 0;
+    uint32_t lastHitTargetId = 0;
     double respawnAt = 0.0;
     double nextFireAt = 0.0;
     double lastHeardAt = 0.0;
@@ -55,13 +70,16 @@ struct Player {
 struct HillState {
     arena::Vec3 center{0.0f, 0.0f, 0.0f};
     float radius = 8.0f;
-    uint16_t team1Score = 0;
-    uint16_t team2Score = 0;
+    float team1TimeLeft = 180.0f;
+    float team2TimeLeft = 180.0f;
     uint8_t ownerTeam = 0;
     uint8_t captureTeam = 0;
     uint8_t contested = 0;
+    uint8_t overtime = 0;
+    uint8_t winnerTeam = 0;
+    uint8_t overtimeCheckTeam = 0;
     float captureProgress = 0.0f;
-    double nextScoreAt = 0.0;
+    double lastUpdateAt = 0.0;
 };
 
 float horizontalSpeed(const arena::Vec3& v) {
@@ -171,6 +189,29 @@ void applyTapStrafeRedirect(Player& player, const arena::Vec3& forward, float we
     player.velocity.z = turned.z * finalSpeed;
 }
 
+void applyAirDash(Player& player, const arena::Vec3& right, const arena::InputPacket& input, double now) {
+    if (input.dashPressed == 0 || player.grounded || !player.jumpedSinceGround || player.airDashCharges <= 0) {
+        return;
+    }
+
+    arena::Vec3 dashWish = right * static_cast<float>(input.dashMoveX);
+    dashWish = arena::normalize(dashWish);
+    if (arena::length(dashWish) <= 0.0001f) {
+        return;
+    }
+
+    player.velocity.x += dashWish.x * AirDashImpulse;
+    player.velocity.z += dashWish.z * AirDashImpulse;
+    const float speed = horizontalSpeed(player.velocity);
+    if (speed > AirDashMaxSpeed) {
+        const float s = AirDashMaxSpeed / speed;
+        player.velocity.x *= s;
+        player.velocity.z *= s;
+    }
+    player.airDashCharges--;
+    player.dashBoostUntil = now + AirDashBoostDuration;
+}
+
 Player* findPlayer(std::vector<Player>& players, const sockaddr_in& address) {
     for (auto& player : players) {
         if (arena::sameAddress(player.address, address)) {
@@ -194,7 +235,7 @@ void sendWelcome(SOCKET socket, const Player& player) {
         sizeof(player.address));
 }
 
-void integrateInput(Player& player, const arena::InputPacket& input) {
+void integrateInput(Player& player, const arena::InputPacket& input, double now) {
     if (player.dead) {
         return;
     }
@@ -220,18 +261,28 @@ void integrateInput(Player& player, const arena::InputPacket& input) {
     }
 
     const float currentHeight = player.crouched ? arena::CrouchHeight : arena::PlayerHeight;
-    const bool jumpPressed = input.jumpPressed != 0;
-    const bool willJump = jumpPressed && player.grounded;
-    if (willJump) {
-        const float jumpScale = (player.equippedWeapon == WeaponSlot::Knife) ? KnifeJumpMultiplier : 1.0f;
-        player.velocityY = arena::JumpVelocity * jumpScale;
-        player.airborneSpeedMultiplier = (player.equippedWeapon == WeaponSlot::Knife) ? KnifeSpeedMultiplier : 1.0f;
-        player.grounded = false;
-    }
-
     arena::Vec3 wish = right * input.moveX + forward * input.moveZ;
     wish = arena::normalize(wish);
     const bool forwardHeld = input.moveZ > 0.1f;
+
+    if (input.jumpPressed != 0) {
+        player.jumpBufferedUntil = now + JumpBufferSeconds;
+    }
+    const bool willJump = player.grounded && now <= player.jumpBufferedUntil;
+    if (willJump) {
+        const float jumpScale = (player.equippedWeapon == WeaponSlot::Knife) ? KnifeJumpMultiplier : 1.0f;
+        player.velocityY = arena::JumpVelocity * jumpScale * JumpVelocityScale;
+        // Preserve directional intent on takeoff, including diagonals.
+        if (arena::length(wish) > 0.0001f) {
+            player.velocity.x += wish.x * JumpStrafeAssist;
+            player.velocity.z += wish.z * JumpStrafeAssist;
+        }
+        player.airborneSpeedMultiplier = (player.equippedWeapon == WeaponSlot::Knife) ? KnifeSpeedMultiplier : 1.0f;
+        player.jumpedSinceGround = true;
+        player.airDashCharges = 1;
+        player.jumpBufferedUntil = 0.0;
+        player.grounded = false;
+    }
 
     const float weaponSpeedScale = player.grounded
         ? ((player.equippedWeapon == WeaponSlot::Knife) ? KnifeSpeedMultiplier : 1.0f)
@@ -245,14 +296,19 @@ void integrateInput(Player& player, const arena::InputPacket& input) {
     } else {
         airAccelerate(player, wish, moveSpeed, SvAirAccelerate, arena::TickSeconds);
         // Apex-like tap strafe redirect: trigger on fresh forward input in air (W or wheel-up).
-        if (!player.grounded && forwardHeld && !player.wasForwardHeld) {
+        if (!player.grounded && !willJump && forwardHeld && !player.wasForwardHeld) {
             applyTapStrafeRedirect(player, forward, weaponSpeedScale);
         }
     }
-    capHorizontalVelocity(player, moveSpeed * MaxBhopSpeedFactor);
+    applyAirDash(player, right, input, now);
+    float speedCap = moveSpeed * MaxBhopSpeedFactor;
+    if (now < player.dashBoostUntil) {
+        speedCap = std::max(speedCap, moveSpeed * AirDashBoostSpeedFactor);
+    }
+    capHorizontalVelocity(player, speedCap);
     player.wasForwardHeld = forwardHeld;
 
-    player.velocityY -= arena::Gravity * arena::TickSeconds;
+    player.velocityY -= arena::Gravity * GravityScale * arena::TickSeconds;
     player.position.x += player.velocity.x * arena::TickSeconds;
     player.position.z += player.velocity.z * arena::TickSeconds;
     player.position.y += player.velocityY * arena::TickSeconds;
@@ -263,6 +319,9 @@ void integrateInput(Player& player, const arena::InputPacket& input) {
         player.grounded = true;
         player.airborneSpeedMultiplier = 1.0f;
         player.wasForwardHeld = false;
+        player.jumpedSinceGround = false;
+        player.airDashCharges = 0;
+        player.dashBoostUntil = 0.0;
     } else {
         player.grounded = false;
     }
@@ -301,10 +360,7 @@ float currentHeightForPlayer(const Player& player) {
     return player.crouched ? arena::CrouchHeight : arena::PlayerHeight;
 }
 
-bool rayHitsPlayerSphere(const arena::Vec3& origin, const arena::Vec3& dir, float maxDistance, const Player& target) {
-    const float h = currentHeightForPlayer(target);
-    const arena::Vec3 center{target.position.x, target.position.y + h * 0.5f, target.position.z};
-    const float radius = arena::PlayerRadius + 0.18f;
+bool rayHitsSphere(const arena::Vec3& origin, const arena::Vec3& dir, float maxDistance, const arena::Vec3& center, float radius) {
     const arena::Vec3 toCenter = center - origin;
     const float t = arena::dot(toCenter, dir);
     if (t < 0.0f || t > maxDistance) {
@@ -315,9 +371,19 @@ bool rayHitsPlayerSphere(const arena::Vec3& origin, const arena::Vec3& dir, floa
     return arena::dot(delta, delta) <= radius * radius;
 }
 
-void processCombatInput(Player& attacker, std::vector<Player>& players, const arena::InputPacket& input, double now) {
+bool rayHitsPlayerVolumes(const arena::Vec3& origin, const arena::Vec3& dir, float maxDistance, const Player& target) {
+    const float h = currentHeightForPlayer(target);
+    const float bodyRadius = arena::PlayerRadius + 0.14f;
+    const float headRadius = arena::PlayerRadius + 0.10f;
+    const arena::Vec3 bodyCenter{target.position.x, target.position.y + h * 0.46f, target.position.z};
+    const arena::Vec3 headCenter{target.position.x, target.position.y + h - headRadius * 1.05f, target.position.z};
+    return rayHitsSphere(origin, dir, maxDistance, bodyCenter, bodyRadius) ||
+        rayHitsSphere(origin, dir, maxDistance, headCenter, headRadius);
+}
+
+bool processCombatInput(Player& attacker, std::vector<Player>& players, const arena::InputPacket& input, double now) {
     if (attacker.dead || input.firePressed == 0 || now < attacker.nextFireAt) {
-        return;
+        return false;
     }
 
     const arena::Vec3 origin{
@@ -343,7 +409,7 @@ void processCombatInput(Player& attacker, std::vector<Player>& players, const ar
         if (target.id == attacker.id || target.dead || target.teamId == attacker.teamId) {
             continue;
         }
-        if (rayHitsPlayerSphere(origin, dir, range, target)) {
+        if (rayHitsPlayerVolumes(origin, dir, range, target)) {
             const arena::Vec3 toTarget = target.position - attacker.position;
             const float dist = arena::length(toTarget);
             if (dist < bestDistance) {
@@ -354,16 +420,20 @@ void processCombatInput(Player& attacker, std::vector<Player>& players, const ar
     }
 
     if (bestTarget == nullptr) {
-        return;
+        return true;
     }
 
     bestTarget->health = std::max(0, bestTarget->health - damage);
+    attacker.hitConfirmCount++;
+    attacker.lastDamageDealt = static_cast<uint8_t>(std::clamp(damage, 0, 255));
+    attacker.lastHitTargetId = bestTarget->id;
     if (bestTarget->health == 0) {
         bestTarget->dead = true;
         bestTarget->respawnAt = now + RespawnDelaySeconds;
         bestTarget->velocity = {};
         bestTarget->velocityY = 0.0f;
     }
+    return true;
 }
 
 void processRespawns(std::vector<Player>& players, double now) {
@@ -387,6 +457,9 @@ void processRespawns(std::vector<Player>& players, double now) {
         player.nextFireAt = now + 0.2;
         player.wasForwardHeld = false;
         player.airborneSpeedMultiplier = 1.0f;
+        player.jumpedSinceGround = false;
+        player.airDashCharges = 0;
+        player.dashBoostUntil = 0.0;
         player.grounded = true;
 
         if (player.teamId == 1) {
@@ -402,6 +475,15 @@ void processRespawns(std::vector<Player>& players, double now) {
 }
 
 void updateHillState(HillState& hill, const std::vector<Player>& players, double now) {
+    if (hill.lastUpdateAt <= 0.0) {
+        hill.lastUpdateAt = now;
+    }
+    const float frameDt = static_cast<float>(std::max(0.0, now - hill.lastUpdateAt));
+    hill.lastUpdateAt = now;
+    if (hill.winnerTeam != 0) {
+        return;
+    }
+
     int team1OnHill = 0;
     int team2OnHill = 0;
 
@@ -466,13 +548,44 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
         }
     }
 
-    if (hill.contested == 0 && hill.ownerTeam != 0 && capturingTeam == hill.ownerTeam && now >= hill.nextScoreAt) {
+    // TF2-style KOTH timer: owning team clock counts down.
+    if (hill.overtime == 0 && hill.contested == 0 && hill.ownerTeam != 0 && frameDt > 0.0f) {
         if (hill.ownerTeam == 1) {
-            hill.team1Score++;
+            hill.team1TimeLeft = std::max(0.0f, hill.team1TimeLeft - frameDt);
         } else if (hill.ownerTeam == 2) {
-            hill.team2Score++;
+            hill.team2TimeLeft = std::max(0.0f, hill.team2TimeLeft - frameDt);
         }
-        hill.nextScoreAt = now + 1.0;
+    }
+
+    // Win/overtime checks.
+    if (hill.overtime == 0) {
+        uint8_t zeroTeam = 0;
+        if (hill.team1TimeLeft <= 0.0f) zeroTeam = 1;
+        if (hill.team2TimeLeft <= 0.0f) zeroTeam = 2;
+        if (zeroTeam != 0) {
+            const uint8_t otherTeam = (zeroTeam == 1) ? 2 : 1;
+            const bool otherCapturing = (hill.captureTeam == otherTeam && hill.captureProgress > 0.0f && hill.ownerTeam != otherTeam);
+            if (otherCapturing) {
+                hill.overtime = 1;
+                hill.overtimeCheckTeam = zeroTeam;
+            } else {
+                hill.winnerTeam = zeroTeam;
+            }
+        }
+    } else {
+        // Overtime resolution:
+        // - Team at 0 wins if enemy capture progress is fully cleared.
+        // - Enemy wins if they successfully overtake point.
+        const uint8_t checkTeam = hill.overtimeCheckTeam;
+        const uint8_t otherTeam = (checkTeam == 1) ? 2 : 1;
+        const bool otherCapturing = (hill.captureTeam == otherTeam && hill.captureProgress > 0.0f && hill.ownerTeam != otherTeam);
+        if (!otherCapturing && hill.ownerTeam == checkTeam) {
+            hill.winnerTeam = checkTeam;
+            hill.overtime = 0;
+        } else if (hill.ownerTeam == otherTeam) {
+            hill.winnerTeam = otherTeam;
+            hill.overtime = 0;
+        }
     }
 }
 
@@ -481,11 +594,13 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
     packet.header = arena::makeHeader(arena::PacketType::Snapshot);
     packet.serverTick = serverTick;
     packet.playerCount = static_cast<uint32_t>(std::min<size_t>(players.size(), arena::MaxPlayers));
-    packet.team1Score = hill.team1Score;
-    packet.team2Score = hill.team2Score;
+    packet.team1TimeLeftSeconds = static_cast<uint16_t>(std::clamp(static_cast<int>(std::ceil(hill.team1TimeLeft)), 0, 65535));
+    packet.team2TimeLeftSeconds = static_cast<uint16_t>(std::clamp(static_cast<int>(std::ceil(hill.team2TimeLeft)), 0, 65535));
     packet.hillOwnerTeam = hill.ownerTeam;
     packet.hillCaptureTeam = hill.captureTeam;
     packet.hillContested = hill.contested;
+    packet.hillOvertime = hill.overtime;
+    packet.hillWinnerTeam = hill.winnerTeam;
     packet.hillCaptureProgress = hill.captureProgress;
 
     for (uint32_t i = 0; i < packet.playerCount; ++i) {
@@ -499,6 +614,9 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
         packet.players[i].teamId = players[i].teamId;
         packet.players[i].health = static_cast<uint8_t>(std::clamp(players[i].health, 0, MaxHealth));
         packet.players[i].dead = players[i].dead ? 1 : 0;
+        packet.players[i].hitConfirmCount = players[i].hitConfirmCount;
+        packet.players[i].lastDamageDealt = players[i].lastDamageDealt;
+        packet.players[i].lastHitTargetId = players[i].lastHitTargetId;
     }
 
     const int bytes = static_cast<int>(offsetof(arena::SnapshotPacket, players) + sizeof(arena::PlayerStatePacket) * packet.playerCount);
@@ -541,7 +659,7 @@ int main(int argc, char** argv) {
         uint32_t nextPlayerId = 1;
         uint32_t serverTick = 0;
         double nextTickAt = arena::secondsNow();
-        hill.nextScoreAt = nextTickAt + 1.0;
+        hill.lastUpdateAt = nextTickAt;
 
         std::cout << "Arena server listening on UDP port " << port << "\n";
         std::cout << "Press Ctrl+C to stop.\n";
@@ -593,9 +711,14 @@ int main(int argc, char** argv) {
 
                     Player* player = findPlayer(players, from);
                     if (player != nullptr) {
-                        player->lastHeardAt = arena::secondsNow();
-                        integrateInput(*player, input);
-                        processCombatInput(*player, players, input, arena::secondsNow());
+                        const double now = arena::secondsNow();
+                        player->lastHeardAt = now;
+                        integrateInput(*player, input, now);
+                        const bool performedAction = processCombatInput(*player, players, input, now);
+                        if (performedAction && !player->grounded && player->jumpedSinceGround) {
+                            // GunZ-style cancel chaining: airborne attack action refunds one dash.
+                            player->airDashCharges = std::max(player->airDashCharges, 1);
+                        }
                     }
                 }
             }

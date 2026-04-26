@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <string>
@@ -15,7 +16,7 @@ namespace {
 
 constexpr int WindowWidth = 1920;
 constexpr int WindowHeight = 1080;
-constexpr float MouseSensitivity = 0.0015f;
+constexpr float DefaultMouseSensitivity = 0.0009f;
 constexpr float StepIntervalWalk = 0.37f;
 constexpr float StepIntervalCrouch = 0.52f;
 constexpr double FireIntervalSeconds = 0.24;
@@ -43,6 +44,12 @@ enum class WeaponAnimMode {
     KnifeEquip
 };
 
+enum class ScreenMode {
+    MainMenu,
+    Settings,
+    InGame
+};
+
 struct RemotePlayer {
     arena::Vec3 position{};
     float yaw = 0.0f;
@@ -51,6 +58,9 @@ struct RemotePlayer {
     uint8_t teamId = 0;
     uint8_t health = 100;
     bool dead = false;
+    uint16_t hitConfirmCount = 0;
+    uint8_t lastDamageDealt = 0;
+    uint32_t lastHitTargetId = 0;
 };
 
 struct AmmoPack {
@@ -58,15 +68,32 @@ struct AmmoPack {
     bool active = true;
 };
 
+struct DamagePopup {
+    Vector3 worldPos{};
+    int damage = 0;
+    float age = 0.0f;
+    float lifetime = 0.85f;
+};
+
 struct ClientState {
     SOCKET socket = INVALID_SOCKET;
     sockaddr_in serverAddress{};
     bool connected = false;
+    ScreenMode screenMode = ScreenMode::MainMenu;
+    int menuIndex = 0;
+    int settingsIndex = 0;
+    float mouseSensitivity = DefaultMouseSensitivity;
+    bool hitSoundEnabled = true;
+    float hitSoundVolume = 0.65f;
+    double mainMenuOpenedAt = 0.0;
     uint32_t localPlayerId = 0;
     uint32_t inputSequence = 0;
     arena::Vec3 localPosition{0.0f, 0.0f, -6.0f};
     arena::Vec3 smoothedRenderPosition{0.0f, 0.0f, -6.0f};
     bool smoothedRenderPositionInitialized = false;
+    arena::Vec3 lastSpeedSamplePosition{0.0f, 0.0f, -6.0f};
+    bool speedSampleInitialized = false;
+    float currentSpeed = 0.0f;
     float yaw = 0.0f;
     float pitch = 0.0f;
     bool localCrouched = false;
@@ -77,6 +104,10 @@ struct ClientState {
 
     Texture2D wallTexture{};
     Texture2D floorTexture{};
+    Texture2D menuBackgroundTexture{};
+    bool menuBackgroundLoaded = false;
+    Texture2D logoTexture{};
+    bool logoLoaded = false;
     std::array<Texture2D, 8> shotgunFrames{};
     int shotgunFrameCount = 0;
     Texture2D knifeIdle{};
@@ -96,6 +127,8 @@ struct ClientState {
     std::array<Sound, 4> shotgunReloadSounds{};
     int shotgunReloadSoundCount = 0;
     Sound knifeEquip{};
+    Sound hitSound{};
+    bool hitSoundLoaded = false;
     std::array<Sound, 4> footstepSounds{};
     int footstepSoundCount = 0;
 
@@ -110,19 +143,31 @@ struct ClientState {
     WeaponSlot lastEquippedWeapon = WeaponSlot::Shotgun;
     uint8_t localTeamId = 0;
     uint8_t localHealth = 100;
+    uint16_t localHitConfirmCount = 0;
+    bool localHitConfirmInitialized = false;
     bool localDead = false;
     float weaponBobPhase = 0.0f;
     float recoilOffset = 0.0f;
     bool jumpQueued = false;
     bool fireQueued = false;
+    bool dashQueued = false;
+    int8_t dashMoveX = 0;
+    int8_t dashMoveZ = 0;
+    double lastWPressAt = -10.0;
+    double lastAPressAt = -10.0;
+    double lastSPressAt = -10.0;
+    double lastDPressAt = -10.0;
     int wheelForwardTicks = 0;
-    uint16_t team1Score = 0;
-    uint16_t team2Score = 0;
+    uint16_t team1TimeLeftSeconds = 180;
+    uint16_t team2TimeLeftSeconds = 180;
     uint8_t hillOwnerTeam = 0;
     uint8_t hillCaptureTeam = 0;
     uint8_t hillContested = 0;
+    uint8_t hillOvertime = 0;
+    uint8_t hillWinnerTeam = 0;
     float hillCaptureProgress = 0.0f;
     std::vector<AmmoPack> ammoPacks;
+    std::vector<DamagePopup> damagePopups;
 };
 
 arena::Vec3 lerpVec3(arena::Vec3 a, arena::Vec3 b, float t) {
@@ -131,6 +176,35 @@ arena::Vec3 lerpVec3(arena::Vec3 a, arena::Vec3 b, float t) {
         a.y + (b.y - a.y) * t,
         a.z + (b.z - a.z) * t
     };
+}
+
+float easeOutCubic(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    const float inv = 1.0f - t;
+    return 1.0f - inv * inv * inv;
+}
+
+std::string formatClock(uint16_t secondsLeft) {
+    const int total = static_cast<int>(secondsLeft);
+    const int minutes = total / 60;
+    const int seconds = total % 60;
+    char buffer[16]{};
+    std::snprintf(buffer, sizeof(buffer), "%d:%02d", minutes, seconds);
+    return std::string(buffer);
+}
+
+void drawTextureCover(const Texture2D& texture, int screenWidth, int screenHeight, Color tint) {
+    if (texture.id == 0 || texture.width <= 0 || texture.height <= 0) {
+        return;
+    }
+    const float sx = static_cast<float>(screenWidth) / static_cast<float>(texture.width);
+    const float sy = static_cast<float>(screenHeight) / static_cast<float>(texture.height);
+    const float scale = std::max(sx, sy);
+    const float drawW = static_cast<float>(texture.width) * scale;
+    const float drawH = static_cast<float>(texture.height) * scale;
+    const float x = (static_cast<float>(screenWidth) - drawW) * 0.5f;
+    const float y = (static_cast<float>(screenHeight) - drawH) * 0.5f;
+    DrawTextureEx(texture, {x, y}, 0.0f, scale, tint);
 }
 
 Vector3 toRaylib(arena::Vec3 value) {
@@ -191,6 +265,20 @@ void tileMeshUV(Mesh& mesh, float tileU, float tileV) {
 void initAssets(ClientState& state) {
     state.wallTexture = loadTextureAsset("assets\\128x128\\128x128\\Tile\\Photoreal_Tile_03-512x512.png");
     state.floorTexture = loadTextureAsset("assets\\128x128\\128x128\\Concrete\\Photoreal_Concrete_03-512x512.png");
+    try {
+        state.menuBackgroundTexture = loadTextureAsset("assets\\bg.png");
+        SetTextureWrap(state.menuBackgroundTexture, TEXTURE_WRAP_CLAMP);
+        state.menuBackgroundLoaded = state.menuBackgroundTexture.id != 0;
+    } catch (...) {
+        state.menuBackgroundLoaded = false;
+    }
+    try {
+        state.logoTexture = loadTextureAsset("assets\\logo.png");
+        SetTextureWrap(state.logoTexture, TEXTURE_WRAP_CLAMP);
+        state.logoLoaded = state.logoTexture.id != 0;
+    } catch (...) {
+        state.logoLoaded = false;
+    }
 
     Mesh floorMesh = GenMeshPlane(arena::RoomHalfSize * 2.0f, arena::RoomHalfSize * 2.0f, 32, 32);
     Mesh ceilingMesh = GenMeshPlane(arena::RoomHalfSize * 2.0f, arena::RoomHalfSize * 2.0f, 32, 32);
@@ -261,6 +349,20 @@ void initAssets(ClientState& state) {
     state.shotgunReloadSounds[3] = loadSoundAsset("assets\\weapons\\doubleshotgun\\reload4.wav");
     state.shotgunReloadSoundCount = 4;
     state.knifeEquip = loadSoundAsset("assets\\weapons\\karambit\\equip.wav");
+    try {
+        state.hitSound = loadSoundAsset("assets\\sound\\hit.mp3");
+        state.hitSoundLoaded = state.hitSound.stream.buffer != nullptr;
+    } catch (...) {
+        try {
+            state.hitSound = loadSoundAsset("assets\\sound\\hit.wav");
+            state.hitSoundLoaded = state.hitSound.stream.buffer != nullptr;
+        } catch (...) {
+            state.hitSoundLoaded = false;
+        }
+    }
+    if (state.hitSoundLoaded) {
+        SetSoundVolume(state.hitSound, state.hitSoundVolume);
+    }
     state.footstepSounds[0] = loadSoundAsset("assets\\sound\\boots1.wav");
     state.footstepSounds[1] = loadSoundAsset("assets\\sound\\boots2.wav");
     state.footstepSounds[2] = loadSoundAsset("assets\\sound\\boots3.wav");
@@ -294,6 +396,10 @@ void unloadAssets(ClientState& state) {
             UnloadSound(state.shotgunReloadSounds[i]);
         }
         UnloadSound(state.knifeEquip);
+        if (state.hitSoundLoaded) {
+            UnloadSound(state.hitSound);
+            state.hitSoundLoaded = false;
+        }
         for (int i = 0; i < state.footstepSoundCount; ++i) {
             UnloadSound(state.footstepSounds[i]);
         }
@@ -321,6 +427,12 @@ void unloadAssets(ClientState& state) {
 
     UnloadTexture(state.wallTexture);
     UnloadTexture(state.floorTexture);
+    if (state.menuBackgroundLoaded && state.menuBackgroundTexture.id != 0) {
+        UnloadTexture(state.menuBackgroundTexture);
+    }
+    if (state.logoLoaded && state.logoTexture.id != 0) {
+        UnloadTexture(state.logoTexture);
+    }
     state.assetsLoaded = false;
 }
 
@@ -361,8 +473,8 @@ void sendHello(ClientState& state) {
 
 void updateLook(ClientState& state) {
     const Vector2 mouseDelta = GetMouseDelta();
-    state.yaw += mouseDelta.x * MouseSensitivity;
-    state.pitch -= mouseDelta.y * MouseSensitivity;
+    state.yaw += mouseDelta.x * state.mouseSensitivity;
+    state.pitch -= mouseDelta.y * state.mouseSensitivity;
 
     constexpr float keyboardLookSpeed = 0.035f;
     if (keyDown(KEY_LEFT)) state.yaw -= keyboardLookSpeed;
@@ -371,6 +483,152 @@ void updateLook(ClientState& state) {
     if (keyDown(KEY_DOWN)) state.pitch -= keyboardLookSpeed;
 
     state.pitch = arena::clamp(state.pitch, -arena::MaxLookPitch, arena::MaxLookPitch);
+}
+
+bool drawMenuButton(const Rectangle& rect, const char* text, bool selected) {
+    const Vector2 mouse = GetMousePosition();
+    const bool hovered = CheckCollisionPointRec(mouse, rect);
+    const bool active = selected || hovered;
+    const int fontSize = active ? 48 : 44;
+    const int tw = MeasureText(text, fontSize);
+    const int tx = static_cast<int>(rect.x + (rect.width - tw) * 0.5f);
+    const int ty = static_cast<int>(rect.y + (rect.height - fontSize) * 0.5f - 2.0f);
+    DrawText(text, tx + 4, ty + 4, fontSize, Color{0, 0, 0, 180});
+    if (active) {
+        DrawText(">", static_cast<int>(rect.x + 8), ty, fontSize, Color{255, 206, 146, 255});
+        DrawText(text, tx, ty, fontSize, Color{255, 228, 188, 255});
+    } else {
+        DrawText(text, tx, ty, fontSize, Color{220, 226, 232, 242});
+    }
+    return hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+}
+
+void drawMainMenu(ClientState& state) {
+    BeginDrawing();
+    const int sw = GetScreenWidth();
+    const int sh = GetScreenHeight();
+    if (state.menuBackgroundLoaded && state.menuBackgroundTexture.id != 0) {
+        drawTextureCover(state.menuBackgroundTexture, sw, sh, Color{255, 255, 255, 255});
+    } else {
+        ClearBackground(Color{16, 18, 24, 255});
+    }
+
+    const float menuTime = static_cast<float>(GetTime() - state.mainMenuOpenedAt);
+    const float intro = easeOutCubic(menuTime / 1.1f);
+
+    const float leftSpaceW = sw * 0.35f;
+    const float columnW = std::min(500.0f, leftSpaceW * 0.82f);
+    const float columnX = (leftSpaceW - columnW) * 0.5f;
+    const float baseY = sh * 0.56f;
+
+    if (state.logoLoaded && state.logoTexture.id != 0) {
+        const float floatY = std::sin(menuTime * 1.9f) * 7.0f;
+        const float pulse = 1.0f + std::sin(menuTime * 2.6f) * 0.02f;
+        const float targetLogoWidth = columnW * 0.92f;
+        const float fitScale = targetLogoWidth / static_cast<float>(state.logoTexture.width);
+        const float scale = (fitScale * (0.90f + intro * 0.10f)) * pulse;
+        const float drawW = static_cast<float>(state.logoTexture.width) * scale;
+        const float drawH = static_cast<float>(state.logoTexture.height) * scale;
+        const float x = columnX + (columnW - drawW) * 0.5f;
+        const float y = -drawH * (1.0f - intro) + sh * 0.11f + floatY;
+        const unsigned char alpha = static_cast<unsigned char>(std::clamp(intro, 0.0f, 1.0f) * 255.0f);
+        DrawTextureEx(state.logoTexture, {x + 6.0f, y + 6.0f}, std::sin(menuTime * 1.2f) * 1.2f, scale, Color{0, 0, 0, static_cast<unsigned char>(alpha * 0.62f)});
+        DrawTextureEx(state.logoTexture, {x, y}, std::sin(menuTime * 1.2f) * 1.6f, scale, Color{255, 255, 255, alpha});
+    }
+
+    Rectangle buttons[3] = {
+        {columnX, baseY, columnW, 68.0f},
+        {columnX, baseY + 92.0f, columnW, 68.0f},
+        {columnX, baseY + 184.0f, columnW, 68.0f}
+    };
+
+    if (IsKeyPressed(KEY_UP)) state.menuIndex = (state.menuIndex + 2) % 3;
+    if (IsKeyPressed(KEY_DOWN)) state.menuIndex = (state.menuIndex + 1) % 3;
+
+    bool joinClicked = drawMenuButton(buttons[0], "Join Game", state.menuIndex == 0);
+    bool settingsClicked = drawMenuButton(buttons[1], "Settings", state.menuIndex == 1);
+    bool quitClicked = drawMenuButton(buttons[2], "Quit Game", state.menuIndex == 2);
+
+    const bool activate = IsKeyPressed(KEY_ENTER);
+    if (joinClicked || (activate && state.menuIndex == 0)) {
+        state.screenMode = ScreenMode::InGame;
+        state.connected = false;
+        state.localPlayerId = 0;
+        state.players.clear();
+        DisableCursor();
+    } else if (settingsClicked || (activate && state.menuIndex == 1)) {
+        state.screenMode = ScreenMode::Settings;
+    } else if (quitClicked || (activate && state.menuIndex == 2)) {
+        CloseWindow();
+    }
+
+    const char* hint = "Use Up/Down + Enter, or mouse";
+    const int hintSize = 24;
+    const int hx = static_cast<int>(columnX + (columnW - MeasureText(hint, hintSize)) * 0.5f);
+    const int hy = static_cast<int>(baseY + 292.0f);
+    DrawText(hint, hx + 3, hy + 3, hintSize, Color{0, 0, 0, 175});
+    DrawText(hint, hx, hy, hintSize, Color{204, 210, 220, 242});
+    EndDrawing();
+}
+
+void drawSettingsMenu(ClientState& state) {
+    BeginDrawing();
+    const int sw = GetScreenWidth();
+    const int sh = GetScreenHeight();
+    if (state.menuBackgroundLoaded && state.menuBackgroundTexture.id != 0) {
+        drawTextureCover(state.menuBackgroundTexture, sw, sh, Color{255, 255, 255, 255});
+        DrawRectangle(0, 0, static_cast<int>(sw * 0.34f), sh, Color{9, 14, 22, 200});
+        DrawRectangleGradientH(static_cast<int>(sw * 0.32f), 0, static_cast<int>(sw * 0.14f), sh, Color{9, 14, 22, 200}, Color{9, 14, 22, 0});
+    } else {
+        ClearBackground(Color{16, 18, 24, 255});
+    }
+
+    const float columnX = std::max(48.0f, sw * 0.08f);
+    const float columnW = std::min(460.0f, sw * 0.26f);
+    DrawText("Settings", static_cast<int>(columnX + (columnW - MeasureText("Settings", 72)) * 0.5f), 120, 72, Color{228, 236, 255, 255});
+
+    if (IsKeyPressed(KEY_UP)) state.settingsIndex = (state.settingsIndex + 2) % 3;
+    if (IsKeyPressed(KEY_DOWN)) state.settingsIndex = (state.settingsIndex + 1) % 3;
+
+    const bool leftAdjust = IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A);
+    const bool rightAdjust = IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D);
+    const bool toggle = IsKeyPressed(KEY_ENTER);
+
+    if (state.settingsIndex == 0) {
+        if (leftAdjust) state.mouseSensitivity = std::max(0.0003f, state.mouseSensitivity - 0.0001f);
+        if (rightAdjust) state.mouseSensitivity = std::min(0.006f, state.mouseSensitivity + 0.0001f);
+    } else if (state.settingsIndex == 1) {
+        if (leftAdjust || rightAdjust || toggle) state.hitSoundEnabled = !state.hitSoundEnabled;
+    } else if (state.settingsIndex == 2) {
+        if (leftAdjust) state.hitSoundVolume = std::max(0.0f, state.hitSoundVolume - 0.05f);
+        if (rightAdjust) state.hitSoundVolume = std::min(1.0f, state.hitSoundVolume + 0.05f);
+        if (state.hitSoundLoaded) {
+            SetSoundVolume(state.hitSound, state.hitSoundVolume);
+        }
+    }
+
+    auto drawSettingRow = [&](int index, float y, const char* label, const char* value) {
+        const bool selected = state.settingsIndex == index;
+        const Color labelColor = selected ? Color{245, 230, 196, 255} : RAYWHITE;
+        const Color valueColor = selected ? Color{255, 210, 145, 255} : Color{224, 214, 195, 255};
+        DrawText(label, static_cast<int>(columnX + 24.0f), static_cast<int>(y), 32, labelColor);
+        const int vw = MeasureText(value, 32);
+        DrawText(value, static_cast<int>(columnX + columnW - vw - 24.0f), static_cast<int>(y), 32, valueColor);
+    };
+
+    drawSettingRow(0, 272.0f, "Mouse Sensitivity", TextFormat("%.4f", state.mouseSensitivity));
+    drawSettingRow(1, 336.0f, "Hit Sound", state.hitSoundEnabled ? "On" : "Off");
+    drawSettingRow(2, 400.0f, "Hit Volume", TextFormat("%d%%", static_cast<int>(std::round(state.hitSoundVolume * 100.0f))));
+
+    DrawText("Up/Down to select | Left/Right to adjust", static_cast<int>(columnX + (columnW - MeasureText("Up/Down to select | Left/Right to adjust", 24)) * 0.5f), 470, 24, Color{172, 178, 192, 255});
+    DrawText("Press Esc to return", static_cast<int>(columnX + (columnW - MeasureText("Press Esc to return", 24)) * 0.5f), 504, 24, Color{172, 178, 192, 255});
+
+    if (IsKeyPressed(KEY_ESCAPE)) {
+        state.screenMode = ScreenMode::MainMenu;
+        state.mainMenuOpenedAt = GetTime();
+    }
+
+    EndDrawing();
 }
 
 void sendInput(ClientState& state) {
@@ -396,12 +654,19 @@ void sendInput(ClientState& state) {
     packet.moveZ = moveZ;
     packet.yaw = state.yaw;
     packet.pitch = state.pitch;
-    packet.jumpPressed = state.jumpQueued ? 1 : 0;
+    const bool holdJump = keyDown(KEY_SPACE);
+    packet.jumpPressed = (state.jumpQueued || holdJump) ? 1 : 0;
     packet.firePressed = state.fireQueued ? 1 : 0;
+    packet.dashPressed = state.dashQueued ? 1 : 0;
+    packet.dashMoveX = state.dashMoveX;
+    packet.dashMoveZ = state.dashMoveZ;
     packet.crouchHeld = (keyDown(KEY_LEFT_SHIFT) || keyDown(KEY_RIGHT_SHIFT)) ? 1 : 0;
     packet.weaponSlot = static_cast<uint8_t>(state.equippedWeapon);
     state.jumpQueued = false;
     state.fireQueued = false;
+    state.dashQueued = false;
+    state.dashMoveX = 0;
+    state.dashMoveZ = 0;
 
     sendto(
         state.socket,
@@ -454,14 +719,19 @@ void pumpNetwork(ClientState& state) {
                 player.teamId = packet.players[i].teamId;
                 player.health = packet.players[i].health;
                 player.dead = packet.players[i].dead != 0;
+                player.hitConfirmCount = packet.players[i].hitConfirmCount;
+                player.lastDamageDealt = packet.players[i].lastDamageDealt;
+                player.lastHitTargetId = packet.players[i].lastHitTargetId;
                 nextPlayers[packet.players[i].playerId] = player;
             }
             state.players = std::move(nextPlayers);
-            state.team1Score = packet.team1Score;
-            state.team2Score = packet.team2Score;
+            state.team1TimeLeftSeconds = packet.team1TimeLeftSeconds;
+            state.team2TimeLeftSeconds = packet.team2TimeLeftSeconds;
             state.hillOwnerTeam = packet.hillOwnerTeam;
             state.hillCaptureTeam = packet.hillCaptureTeam;
             state.hillContested = packet.hillContested;
+            state.hillOvertime = packet.hillOvertime;
+            state.hillWinnerTeam = packet.hillWinnerTeam;
             state.hillCaptureProgress = packet.hillCaptureProgress;
         }
     }
@@ -475,6 +745,22 @@ void syncLocalPosition(ClientState& state) {
         state.localTeamId = it->second.teamId;
         state.localHealth = it->second.health;
         state.localDead = it->second.dead;
+        if (state.localHitConfirmInitialized && it->second.hitConfirmCount != state.localHitConfirmCount &&
+            state.hitSoundEnabled && state.hitSoundLoaded && state.audioReady) {
+            PlaySound(state.hitSound);
+        }
+        if (state.localHitConfirmInitialized && it->second.hitConfirmCount != state.localHitConfirmCount) {
+            const auto targetIt = state.players.find(it->second.lastHitTargetId);
+            if (targetIt != state.players.end()) {
+                const float targetHeight = targetIt->second.crouched ? arena::CrouchHeight : arena::PlayerHeight;
+                DamagePopup popup{};
+                popup.damage = static_cast<int>(it->second.lastDamageDealt);
+                popup.worldPos = {targetIt->second.position.x, targetIt->second.position.y + targetHeight + 0.28f, targetIt->second.position.z};
+                state.damagePopups.push_back(popup);
+            }
+        }
+        state.localHitConfirmCount = it->second.hitConfirmCount;
+        state.localHitConfirmInitialized = true;
         if (!state.smoothedRenderPositionInitialized) {
             state.smoothedRenderPosition = state.localPosition;
             state.smoothedRenderPositionInitialized = true;
@@ -491,6 +777,36 @@ void updateSmoothedRenderPosition(ClientState& state, float dt) {
     // Exponential smoothing keeps camera motion stable between snapshot updates.
     const float follow = 1.0f - std::exp(-dt * 20.0f);
     state.smoothedRenderPosition = lerpVec3(state.smoothedRenderPosition, state.localPosition, follow);
+}
+
+void updateSpeedCounter(ClientState& state, float dt) {
+    if (!state.speedSampleInitialized) {
+        state.lastSpeedSamplePosition = state.localPosition;
+        state.speedSampleInitialized = true;
+        state.currentSpeed = 0.0f;
+        return;
+    }
+    if (dt <= 0.00001f) {
+        return;
+    }
+
+    const float dx = state.localPosition.x - state.lastSpeedSamplePosition.x;
+    const float dz = state.localPosition.z - state.lastSpeedSamplePosition.z;
+    const float instSpeed = std::sqrt(dx * dx + dz * dz) / dt;
+    state.currentSpeed += (instSpeed - state.currentSpeed) * std::clamp(dt * 18.0f, 0.0f, 1.0f);
+    state.lastSpeedSamplePosition = state.localPosition;
+}
+
+void updateDamagePopups(ClientState& state, float dt) {
+    for (DamagePopup& popup : state.damagePopups) {
+        popup.age += dt;
+        popup.worldPos.y += dt * 1.25f;
+    }
+    state.damagePopups.erase(
+        std::remove_if(state.damagePopups.begin(), state.damagePopups.end(), [](const DamagePopup& popup) {
+            return popup.age >= popup.lifetime;
+        }),
+        state.damagePopups.end());
 }
 
 void drawRoom(const ClientState& state) {
@@ -808,12 +1124,26 @@ void render(ClientState& state, double now) {
     }
 
     EndMode3D();
+    for (const DamagePopup& popup : state.damagePopups) {
+        const float t = std::clamp(popup.age / popup.lifetime, 0.0f, 1.0f);
+        const unsigned char alpha = static_cast<unsigned char>((1.0f - t) * 255.0f);
+        const Vector2 p = GetWorldToScreen(popup.worldPos, camera);
+        if (p.x < -100.0f || p.y < -100.0f || p.x > static_cast<float>(GetScreenWidth()) + 100.0f || p.y > static_cast<float>(GetScreenHeight()) + 100.0f) {
+            continue;
+        }
+        const char* txt = TextFormat("%d", popup.damage);
+        const int fs = 28;
+        const int tw = MeasureText(txt, fs);
+        DrawText(txt, static_cast<int>(p.x - tw * 0.5f + 2.0f), static_cast<int>(p.y + 2.0f), fs, Color{0, 0, 0, static_cast<unsigned char>(alpha * 0.7f)});
+        DrawText(txt, static_cast<int>(p.x - tw * 0.5f), static_cast<int>(p.y), fs, Color{255, 205, 125, alpha});
+    }
     drawViewmodel(state, now);
 
     const int cx = GetScreenWidth() / 2;
     const int cy = GetScreenHeight() / 2;
     DrawLine(cx - 8, cy, cx + 8, cy, RED);
     DrawLine(cx, cy - 8, cx, cy + 8, RED);
+    DrawText(TextFormat("%.1f u/s", state.currentSpeed), cx + 14, cy + 14, 20, Color{225, 232, 245, 255});
 
     const std::string status = state.connected
         ? "Connected as player " + std::to_string(state.localPlayerId) + " | players: " + std::to_string(state.players.size())
@@ -825,12 +1155,17 @@ void render(ClientState& state, double now) {
         : "Karambit ready";
     DrawText(("Weapon: " + weaponLabel).c_str(), 16, 42, 20, RAYWHITE);
     DrawText(ammoText.c_str(), 16, 68, 20, RAYWHITE);
+    const std::string t1Clock = formatClock(state.team1TimeLeftSeconds);
+    const std::string t2Clock = formatClock(state.team2TimeLeftSeconds);
     const std::string teamText = "Team " + std::to_string(state.localTeamId == 0 ? 1 : state.localTeamId) +
-        " | HP: " + std::to_string(state.localHealth) +
-        " | KOTH score T1: " + std::to_string(state.team1Score) + "  T2: " + std::to_string(state.team2Score);
+        " | HP: " + std::to_string(state.localHealth) + " | KOTH clock T1: " + t1Clock + "  T2: " + t2Clock;
     DrawText(teamText.c_str(), 16, 94, 20, RAYWHITE);
     std::string hillText = "Hill: Neutral";
-    if (state.hillContested != 0) {
+    if (state.hillWinnerTeam != 0) {
+        hillText = "Round Over: Team " + std::to_string(state.hillWinnerTeam) + " wins";
+    } else if (state.hillOvertime != 0) {
+        hillText = "Hill: OVERTIME";
+    } else if (state.hillContested != 0) {
         hillText = "Hill: Contested";
     }
     if (state.hillOwnerTeam == 1) hillText = "Hill: Owned by Team 1";
@@ -843,7 +1178,7 @@ void render(ClientState& state, double now) {
     if (state.localDead) {
         DrawText("You are dead - respawning...", GetScreenWidth() / 2 - 190, GetScreenHeight() / 2 - 70, 30, RED);
     }
-    DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | Shift crouch | 1 shotgun | 3 knife | LMB attack/fire | F inspect | Esc quit", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
+    DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | A/D double-tap air dash | Shift crouch | 1 shotgun | 3 knife | LMB attack/fire | F inspect | Esc menu", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
     DrawFPS(GetScreenWidth() - 95, 12);
 
     EndDrawing();
@@ -867,9 +1202,11 @@ int main(int argc, char** argv) {
         arena::makeNonBlocking(state.socket);
 
         SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_UNDECORATED);
-        InitWindow(WindowWidth, WindowHeight, "Arena FPS Networking Demo");
+        InitWindow(WindowWidth, WindowHeight, "KOTH");
+        SetExitKey(KEY_NULL);
         SetWindowPosition(0, 0);
-        DisableCursor();
+        EnableCursor();
+        state.mainMenuOpenedAt = GetTime();
         initAssets(state);
 
         double nextHelloAt = 0.0;
@@ -877,16 +1214,50 @@ int main(int argc, char** argv) {
         std::cout << "Connecting to " << host << ":" << port << "\n";
 
         while (!WindowShouldClose()) {
+            if (state.screenMode == ScreenMode::MainMenu) {
+                if (IsCursorHidden()) {
+                    EnableCursor();
+                }
+                drawMainMenu(state);
+                continue;
+            }
+
+            if (state.screenMode == ScreenMode::Settings) {
+                if (IsCursorHidden()) {
+                    EnableCursor();
+                }
+                drawSettingsMenu(state);
+                continue;
+            }
+
             if (IsWindowFocused() && !IsCursorHidden()) {
                 DisableCursor();
             }
 
             const float wheelMove = GetMouseWheelMove();
+            const double inputNow = arena::secondsNow();
+            const bool airborne = state.localPosition.y > 0.05f;
+            constexpr double dashTapWindow = 0.25;
+            auto tryQueueDash = [&](double& lastAt, int8_t mx, int8_t mz) {
+                if (airborne && (inputNow - lastAt) <= dashTapWindow) {
+                    state.dashQueued = true;
+                    state.dashMoveX = mx;
+                    state.dashMoveZ = mz;
+                }
+                lastAt = inputNow;
+            };
+
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 state.fireQueued = true;
             }
             if (IsKeyPressed(KEY_SPACE)) {
                 state.jumpQueued = true;
+            }
+            if (IsKeyPressed(KEY_A)) {
+                tryQueueDash(state.lastAPressAt, -1, 0);
+            }
+            if (IsKeyPressed(KEY_D)) {
+                tryQueueDash(state.lastDPressAt, 1, 0);
             }
             if (wheelMove < 0.0f) {
                 state.jumpQueued = true;
@@ -907,6 +1278,12 @@ int main(int argc, char** argv) {
                 }
                 equipWeapon(state, target, arena::secondsNow());
             }
+            if (IsKeyPressed(KEY_ESCAPE)) {
+                state.screenMode = ScreenMode::MainMenu;
+                state.mainMenuOpenedAt = GetTime();
+                EnableCursor();
+                continue;
+            }
 
             const double now = arena::secondsNow();
             const float dt = GetFrameTime();
@@ -925,6 +1302,8 @@ int main(int argc, char** argv) {
             pumpNetwork(state);
             syncLocalPosition(state);
             updateSmoothedRenderPosition(state, dt);
+            updateSpeedCounter(state, dt);
+            updateDamagePopups(state, dt);
             updateViewmodelAndFootsteps(state, now, dt);
             updateWeaponAnimationState(state, now);
             render(state, now);
