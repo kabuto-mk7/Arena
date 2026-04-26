@@ -16,7 +16,7 @@ namespace {
 
 constexpr int WindowWidth = 1280;
 constexpr int WindowHeight = 720;
-constexpr float DefaultMouseSensitivity = 0.0009f;
+constexpr float DefaultMouseSensitivity = 0.0005f;
 constexpr float StepIntervalWalk = 0.37f;
 constexpr float StepIntervalCrouch = 0.52f;
 constexpr double FireIntervalSeconds = 0.24;
@@ -1019,44 +1019,36 @@ void updateDamagePopups(ClientState& state, float dt) {
 }
 
 void drawKothTestMapGeometry() {
-    const Color groundA{118, 110, 96, 255};
-    const Color groundB{102, 96, 86, 255};
-    const Color coverA{120, 128, 138, 255};
-    const Color coverB{92, 98, 108, 255};
-    const Color accent{160, 170, 186, 255};
+    const Color block{102, 108, 116, 255};
+    const Color ramp{112, 98, 86, 255};
+    const Color wire{168, 176, 190, 220};
 
-    // Soft terrain variation around the hill.
-    DrawCube({0.0f, 0.18f, 0.0f}, 26.0f, 0.36f, 26.0f, groundA);
-    DrawCube({-13.0f, 0.14f, -13.0f}, 14.0f, 0.28f, 14.0f, groundB);
-    DrawCube({13.0f, 0.14f, -13.0f}, 14.0f, 0.28f, 14.0f, groundB);
-    DrawCube({-13.0f, 0.14f, 13.0f}, 14.0f, 0.28f, 14.0f, groundB);
-    DrawCube({13.0f, 0.14f, 13.0f}, 14.0f, 0.28f, 14.0f, groundB);
+    const auto drawSolid = [&](Vector3 c, Vector3 s, Color col) {
+        DrawCube(c, s.x, s.y, s.z, col);
+        DrawCubeWires(c, s.x, s.y, s.z, wire);
+    };
 
-    // Mid cover blocks around point.
-    DrawCube({-8.0f, 1.15f, 0.0f}, 2.0f, 2.3f, 6.4f, coverA);
-    DrawCube({8.0f, 1.15f, 0.0f}, 2.0f, 2.3f, 6.4f, coverA);
-    DrawCube({0.0f, 1.15f, -8.0f}, 6.4f, 2.3f, 2.0f, coverA);
-    DrawCube({0.0f, 1.15f, 8.0f}, 6.4f, 2.3f, 2.0f, coverA);
-    DrawCubeWires({-8.0f, 1.15f, 0.0f}, 2.0f, 2.3f, 6.4f, accent);
-    DrawCubeWires({8.0f, 1.15f, 0.0f}, 2.0f, 2.3f, 6.4f, accent);
-    DrawCubeWires({0.0f, 1.15f, -8.0f}, 6.4f, 2.3f, 2.0f, accent);
-    DrawCubeWires({0.0f, 1.15f, 8.0f}, 6.4f, 2.3f, 2.0f, accent);
+    // Sight-blocking core around point.
+    drawSolid({0.0f, 1.0f, 0.0f}, {4.0f, 2.0f, 20.0f}, block);
+    drawSolid({0.0f, 1.0f, 0.0f}, {20.0f, 2.0f, 4.0f}, block);
+    drawSolid({-12.0f, 0.6f, 0.0f}, {4.0f, 1.2f, 8.0f}, block);
+    drawSolid({12.0f, 0.6f, 0.0f}, {4.0f, 1.2f, 8.0f}, block);
+    drawSolid({0.0f, 0.6f, -12.0f}, {8.0f, 1.2f, 4.0f}, block);
+    drawSolid({0.0f, 0.6f, 12.0f}, {8.0f, 1.2f, 4.0f}, block);
 
-    // Outer lane structures.
-    DrawCube({-24.0f, 2.0f, -22.0f}, 6.0f, 4.0f, 6.0f, coverB);
-    DrawCube({24.0f, 2.0f, -22.0f}, 6.0f, 4.0f, 6.0f, coverB);
-    DrawCube({-24.0f, 2.0f, 22.0f}, 6.0f, 4.0f, 6.0f, coverB);
-    DrawCube({24.0f, 2.0f, 22.0f}, 6.0f, 4.0f, 6.0f, coverB);
-    DrawCubeWires({-24.0f, 2.0f, -22.0f}, 6.0f, 4.0f, 6.0f, accent);
-    DrawCubeWires({24.0f, 2.0f, -22.0f}, 6.0f, 4.0f, 6.0f, accent);
-    DrawCubeWires({-24.0f, 2.0f, 22.0f}, 6.0f, 4.0f, 6.0f, accent);
-    DrawCubeWires({24.0f, 2.0f, 22.0f}, 6.0f, 4.0f, 6.0f, accent);
+    // Outer blockers.
+    drawSolid({-24.0f, 1.4f, -16.0f}, {6.0f, 2.8f, 6.0f}, block);
+    drawSolid({24.0f, 1.4f, -16.0f}, {6.0f, 2.8f, 6.0f}, block);
+    drawSolid({-24.0f, 1.4f, 16.0f}, {6.0f, 2.8f, 6.0f}, block);
+    drawSolid({24.0f, 1.4f, 16.0f}, {6.0f, 2.8f, 6.0f}, block);
 
-    // Spawn side lane dividers.
-    DrawCube({-38.0f, 1.35f, -10.0f}, 2.0f, 2.7f, 12.0f, coverB);
-    DrawCube({38.0f, 1.35f, 10.0f}, 2.0f, 2.7f, 12.0f, coverB);
-    DrawCubeWires({-38.0f, 1.35f, -10.0f}, 2.0f, 2.7f, 12.0f, accent);
-    DrawCubeWires({38.0f, 1.35f, 10.0f}, 2.0f, 2.7f, 12.0f, accent);
+    // Ramps / approach steps.
+    drawSolid({-8.5f, 0.2f, 0.0f}, {3.0f, 0.4f, 7.0f}, ramp);
+    drawSolid({-5.4f, 0.5f, 0.0f}, {3.0f, 0.6f, 7.0f}, ramp);
+    drawSolid({8.5f, 0.2f, 0.0f}, {3.0f, 0.4f, 7.0f}, ramp);
+    drawSolid({5.4f, 0.5f, 0.0f}, {3.0f, 0.6f, 7.0f}, ramp);
+    drawSolid({0.0f, 0.2f, -8.5f}, {7.0f, 0.4f, 3.0f}, ramp);
+    drawSolid({0.0f, 0.2f, 8.5f}, {7.0f, 0.4f, 3.0f}, ramp);
 }
 
 void drawRoom(const ClientState& state) {
@@ -1077,9 +1069,19 @@ void drawRoom(const ClientState& state) {
     DrawGrid(32, 5.0f);
 
     constexpr float hillRadius = 8.0f;
-    DrawCylinderWires({0.0f, 0.05f, 0.0f}, hillRadius, hillRadius, 0.08f, 32, Color{245, 245, 210, 255});
-    DrawCircle3D({0.0f, 0.06f, 0.0f}, hillRadius, {1.0f, 0.0f, 0.0f}, 90.0f, Color{245, 245, 210, 30});
-    DrawSphere({0.0f, 0.45f, 0.0f}, 0.28f, Color{255, 240, 180, 220});
+    DrawCircle3D({0.0f, 0.08f, 0.0f}, hillRadius, {1.0f, 0.0f, 0.0f}, 90.0f, Color{255, 238, 165, 60});
+    DrawCircle3D({0.0f, 0.09f, 0.0f}, hillRadius - 0.45f, {1.0f, 0.0f, 0.0f}, 90.0f, Color{255, 240, 170, 28});
+    DrawCylinderWires({0.0f, 0.10f, 0.0f}, hillRadius, hillRadius, 0.12f, 48, Color{255, 240, 170, 255});
+    DrawCylinderWires({0.0f, 0.10f, 0.0f}, hillRadius - 0.45f, hillRadius - 0.45f, 0.10f, 48, Color{255, 246, 210, 190});
+    for (int i = 0; i < 12; ++i) {
+        const float a = (static_cast<float>(i) / 12.0f) * 2.0f * PI;
+        const float sx = std::cos(a) * (hillRadius - 0.3f);
+        const float sz = std::sin(a) * (hillRadius - 0.3f);
+        const float ex = std::cos(a) * (hillRadius + 0.8f);
+        const float ez = std::sin(a) * (hillRadius + 0.8f);
+        DrawLine3D({sx, 0.11f, sz}, {ex, 0.11f, ez}, Color{255, 236, 150, 220});
+    }
+    DrawSphere({0.0f, 0.60f, 0.0f}, 0.30f, Color{255, 240, 180, 220});
 
     for (const AmmoPack& pack : state.ammoPacks) {
         if (!pack.active) {

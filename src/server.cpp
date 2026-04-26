@@ -1,6 +1,7 @@
 #include "net.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <iostream>
 #include <thread>
@@ -42,6 +43,124 @@ constexpr float LightningGunRange = 46.0f;
 constexpr int LightningGunDamagePerTick = 7;
 constexpr float LightningGunTickInterval = 0.05f;
 constexpr float RespawnDelaySeconds = 3.0f;
+
+struct StaticSolid {
+    arena::Vec3 center{};
+    arena::Vec3 size{};
+};
+
+const std::array<StaticSolid, 16>& mapSolids() {
+    static const std::array<StaticSolid, 16> solids{{
+        {{0.0f, 1.0f, 0.0f}, {4.0f, 2.0f, 20.0f}},
+        {{0.0f, 1.0f, 0.0f}, {20.0f, 2.0f, 4.0f}},
+        {{-12.0f, 0.6f, 0.0f}, {4.0f, 1.2f, 8.0f}},
+        {{12.0f, 0.6f, 0.0f}, {4.0f, 1.2f, 8.0f}},
+        {{0.0f, 0.6f, -12.0f}, {8.0f, 1.2f, 4.0f}},
+        {{0.0f, 0.6f, 12.0f}, {8.0f, 1.2f, 4.0f}},
+        {{-24.0f, 1.4f, -16.0f}, {6.0f, 2.8f, 6.0f}},
+        {{24.0f, 1.4f, -16.0f}, {6.0f, 2.8f, 6.0f}},
+        {{-24.0f, 1.4f, 16.0f}, {6.0f, 2.8f, 6.0f}},
+        {{24.0f, 1.4f, 16.0f}, {6.0f, 2.8f, 6.0f}},
+        {{-8.5f, 0.2f, 0.0f}, {3.0f, 0.4f, 7.0f}},
+        {{-5.4f, 0.5f, 0.0f}, {3.0f, 0.6f, 7.0f}},
+        {{8.5f, 0.2f, 0.0f}, {3.0f, 0.4f, 7.0f}},
+        {{5.4f, 0.5f, 0.0f}, {3.0f, 0.6f, 7.0f}},
+        {{0.0f, 0.2f, -8.5f}, {7.0f, 0.4f, 3.0f}},
+        {{0.0f, 0.2f, 8.5f}, {7.0f, 0.4f, 3.0f}},
+    }};
+    return solids;
+}
+
+bool horizontalCircleOverlapsBox(const arena::Vec3& pos, float radius, const StaticSolid& s) {
+    const float minX = s.center.x - s.size.x * 0.5f;
+    const float maxX = s.center.x + s.size.x * 0.5f;
+    const float minZ = s.center.z - s.size.z * 0.5f;
+    const float maxZ = s.center.z + s.size.z * 0.5f;
+    const float closestX = arena::clamp(pos.x, minX, maxX);
+    const float closestZ = arena::clamp(pos.z, minZ, maxZ);
+    const float dx = pos.x - closestX;
+    const float dz = pos.z - closestZ;
+    return (dx * dx + dz * dz) <= (radius * radius);
+}
+
+void resolveHorizontalMapCollisions(arena::Vec3& position, arena::Vec3& velocity, float currentHeight) {
+    const float radius = arena::PlayerRadius;
+    const float playerBottom = position.y;
+    const float playerTop = playerBottom + currentHeight;
+
+    for (int iter = 0; iter < 3; ++iter) {
+        bool resolvedAny = false;
+        for (const StaticSolid& s : mapSolids()) {
+            const float minY = s.center.y - s.size.y * 0.5f;
+            const float maxY = s.center.y + s.size.y * 0.5f;
+            if (playerTop <= minY || playerBottom >= maxY) {
+                continue;
+            }
+
+            const float minX = s.center.x - s.size.x * 0.5f;
+            const float maxX = s.center.x + s.size.x * 0.5f;
+            const float minZ = s.center.z - s.size.z * 0.5f;
+            const float maxZ = s.center.z + s.size.z * 0.5f;
+
+            const float playerMinX = position.x - radius;
+            const float playerMaxX = position.x + radius;
+            const float playerMinZ = position.z - radius;
+            const float playerMaxZ = position.z + radius;
+
+            if (playerMaxX <= minX || playerMinX >= maxX || playerMaxZ <= minZ || playerMinZ >= maxZ) {
+                continue;
+            }
+
+            const float penLeft = playerMaxX - minX;
+            const float penRight = maxX - playerMinX;
+            const float penX = std::min(penLeft, penRight);
+            const float penBack = playerMaxZ - minZ;
+            const float penFront = maxZ - playerMinZ;
+            const float penZ = std::min(penBack, penFront);
+
+            if (penX < penZ) {
+                const float dir = (position.x >= s.center.x) ? 1.0f : -1.0f;
+                position.x += dir * (penX + 0.001f);
+                velocity.x = 0.0f;
+            } else {
+                const float dir = (position.z >= s.center.z) ? 1.0f : -1.0f;
+                position.z += dir * (penZ + 0.001f);
+                velocity.z = 0.0f;
+            }
+            resolvedAny = true;
+        }
+        if (!resolvedAny) {
+            break;
+        }
+    }
+}
+
+bool resolveVerticalMapCollisions(arena::Vec3& position, float& velocityY, float prevY, float currentHeight) {
+    bool landed = false;
+    const float radius = arena::PlayerRadius;
+    for (const StaticSolid& s : mapSolids()) {
+        if (!horizontalCircleOverlapsBox(position, radius, s)) {
+            continue;
+        }
+        const float minY = s.center.y - s.size.y * 0.5f;
+        const float maxY = s.center.y + s.size.y * 0.5f;
+
+        if (velocityY <= 0.0f && prevY >= maxY && position.y <= maxY) {
+            position.y = maxY;
+            velocityY = 0.0f;
+            landed = true;
+            continue;
+        }
+
+        const float prevHead = prevY + currentHeight;
+        const float currentHead = position.y + currentHeight;
+        if (velocityY > 0.0f && prevHead <= minY && currentHead >= minY) {
+            position.y = minY - currentHeight;
+            velocityY = 0.0f;
+        }
+    }
+    return landed;
+}
 
 struct Player {
     uint32_t id = 0;
@@ -320,10 +439,22 @@ void integrateInput(Player& player, const arena::InputPacket& input, double now)
     capHorizontalVelocity(player, speedCap);
     player.wasForwardHeld = forwardHeld;
 
+    const float prevY = player.position.y;
     player.velocityY -= arena::Gravity * GravityScale * arena::TickSeconds;
     player.position.x += player.velocity.x * arena::TickSeconds;
     player.position.z += player.velocity.z * arena::TickSeconds;
     player.position.y += player.velocityY * arena::TickSeconds;
+
+    resolveHorizontalMapCollisions(player.position, player.velocity, currentHeight);
+    const bool landedOnSolid = resolveVerticalMapCollisions(player.position, player.velocityY, prevY, currentHeight);
+    if (landedOnSolid) {
+        player.grounded = true;
+        player.airborneSpeedMultiplier = 1.0f;
+        player.wasForwardHeld = false;
+        player.jumpedSinceGround = false;
+        player.airDashCharges = 0;
+        player.dashBoostUntil = 0.0;
+    }
 
     if (player.position.y <= 0.0f) {
         player.position.y = 0.0f;
@@ -334,7 +465,7 @@ void integrateInput(Player& player, const arena::InputPacket& input, double now)
         player.jumpedSinceGround = false;
         player.airDashCharges = 0;
         player.dashBoostUntil = 0.0;
-    } else {
+    } else if (player.velocityY != 0.0f) {
         player.grounded = false;
     }
 
@@ -391,6 +522,48 @@ bool rayHitsPlayerVolumes(const arena::Vec3& origin, const arena::Vec3& dir, flo
     const arena::Vec3 headCenter{target.position.x, target.position.y + h - headRadius * 1.05f, target.position.z};
     return rayHitsSphere(origin, dir, maxDistance, bodyCenter, bodyRadius) ||
         rayHitsSphere(origin, dir, maxDistance, headCenter, headRadius);
+}
+
+bool rayIntersectsAabb(const arena::Vec3& origin, const arena::Vec3& dir, float maxDistance, const StaticSolid& s, float& outT) {
+    const float minX = s.center.x - s.size.x * 0.5f;
+    const float maxX = s.center.x + s.size.x * 0.5f;
+    const float minY = s.center.y - s.size.y * 0.5f;
+    const float maxY = s.center.y + s.size.y * 0.5f;
+    const float minZ = s.center.z - s.size.z * 0.5f;
+    const float maxZ = s.center.z + s.size.z * 0.5f;
+
+    float tMin = 0.0f;
+    float tMax = maxDistance;
+    auto slab = [&](float o, float d, float mn, float mx) -> bool {
+        if (std::abs(d) < 0.00001f) {
+            return o >= mn && o <= mx;
+        }
+        const float invD = 1.0f / d;
+        float t1 = (mn - o) * invD;
+        float t2 = (mx - o) * invD;
+        if (t1 > t2) std::swap(t1, t2);
+        tMin = std::max(tMin, t1);
+        tMax = std::min(tMax, t2);
+        return tMax >= tMin;
+    };
+
+    if (!slab(origin.x, dir.x, minX, maxX)) return false;
+    if (!slab(origin.y, dir.y, minY, maxY)) return false;
+    if (!slab(origin.z, dir.z, minZ, maxZ)) return false;
+
+    outT = tMin;
+    return outT >= 0.0f && outT <= maxDistance;
+}
+
+float firstWorldBlockerDistance(const arena::Vec3& origin, const arena::Vec3& dir, float maxDistance) {
+    float best = maxDistance + 1.0f;
+    for (const StaticSolid& s : mapSolids()) {
+        float t = 0.0f;
+        if (rayIntersectsAabb(origin, dir, maxDistance, s, t) && t < best) {
+            best = t;
+        }
+    }
+    return best;
 }
 
 bool processCombatInput(Player& attacker, std::vector<Player>& players, const arena::InputPacket& input, double now) {
@@ -464,6 +637,11 @@ bool processCombatInput(Player& attacker, std::vector<Player>& players, const ar
     }
 
     if (bestTarget == nullptr) {
+        return true;
+    }
+
+    const float worldBlockDistance = firstWorldBlockerDistance(origin, dir, bestDistance);
+    if (worldBlockDistance <= bestDistance - 0.02f) {
         return true;
     }
 
