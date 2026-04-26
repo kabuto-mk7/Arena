@@ -65,6 +65,8 @@ struct ClientState {
     uint32_t localPlayerId = 0;
     uint32_t inputSequence = 0;
     arena::Vec3 localPosition{0.0f, 0.0f, -6.0f};
+    arena::Vec3 smoothedRenderPosition{0.0f, 0.0f, -6.0f};
+    bool smoothedRenderPositionInitialized = false;
     float yaw = 0.0f;
     float pitch = 0.0f;
     bool localCrouched = false;
@@ -122,6 +124,14 @@ struct ClientState {
     float hillCaptureProgress = 0.0f;
     std::vector<AmmoPack> ammoPacks;
 };
+
+arena::Vec3 lerpVec3(arena::Vec3 a, arena::Vec3 b, float t) {
+    return {
+        a.x + (b.x - a.x) * t,
+        a.y + (b.y - a.y) * t,
+        a.z + (b.z - a.z) * t
+    };
+}
 
 Vector3 toRaylib(arena::Vec3 value) {
     return {value.x, value.y, value.z};
@@ -465,7 +475,22 @@ void syncLocalPosition(ClientState& state) {
         state.localTeamId = it->second.teamId;
         state.localHealth = it->second.health;
         state.localDead = it->second.dead;
+        if (!state.smoothedRenderPositionInitialized) {
+            state.smoothedRenderPosition = state.localPosition;
+            state.smoothedRenderPositionInitialized = true;
+        }
     }
+}
+
+void updateSmoothedRenderPosition(ClientState& state, float dt) {
+    if (!state.smoothedRenderPositionInitialized) {
+        state.smoothedRenderPosition = state.localPosition;
+        state.smoothedRenderPositionInitialized = true;
+        return;
+    }
+    // Exponential smoothing keeps camera motion stable between snapshot updates.
+    const float follow = 1.0f - std::exp(-dt * 20.0f);
+    state.smoothedRenderPosition = lerpVec3(state.smoothedRenderPosition, state.localPosition, follow);
 }
 
 void drawRoom(const ClientState& state) {
@@ -759,7 +784,7 @@ void drawViewmodel(const ClientState& state, double now) {
 
 void render(ClientState& state, double now) {
     const float localEyeHeight = state.localCrouched ? arena::CrouchEyeHeight : arena::StandEyeHeight;
-    const Vector3 eye{state.localPosition.x, state.localPosition.y + localEyeHeight, state.localPosition.z};
+    const Vector3 eye{state.smoothedRenderPosition.x, state.smoothedRenderPosition.y + localEyeHeight, state.smoothedRenderPosition.z};
     const Vector3 forward = cameraForward(state.yaw, state.pitch);
 
     Camera3D camera{};
@@ -899,6 +924,7 @@ int main(int argc, char** argv) {
 
             pumpNetwork(state);
             syncLocalPosition(state);
+            updateSmoothedRenderPosition(state, dt);
             updateViewmodelAndFootsteps(state, now, dt);
             updateWeaponAnimationState(state, now);
             render(state, now);
