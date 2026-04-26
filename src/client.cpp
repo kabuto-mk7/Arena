@@ -15,7 +15,7 @@ namespace {
 
 constexpr int WindowWidth = 1920;
 constexpr int WindowHeight = 1080;
-constexpr float MouseSensitivity = 0.0022f;
+constexpr float MouseSensitivity = 0.0015f;
 constexpr float StepIntervalWalk = 0.37f;
 constexpr float StepIntervalCrouch = 0.52f;
 constexpr double FireIntervalSeconds = 0.24;
@@ -49,6 +49,8 @@ struct RemotePlayer {
     float pitch = 0.0f;
     bool crouched = false;
     uint8_t teamId = 0;
+    uint8_t health = 100;
+    bool dead = false;
 };
 
 struct AmmoPack {
@@ -105,14 +107,18 @@ struct ClientState {
     WeaponSlot equippedWeapon = WeaponSlot::Knife;
     WeaponSlot lastEquippedWeapon = WeaponSlot::Shotgun;
     uint8_t localTeamId = 0;
+    uint8_t localHealth = 100;
+    bool localDead = false;
     float weaponBobPhase = 0.0f;
     float recoilOffset = 0.0f;
     bool jumpQueued = false;
+    bool fireQueued = false;
     int wheelForwardTicks = 0;
     uint16_t team1Score = 0;
     uint16_t team2Score = 0;
     uint8_t hillOwnerTeam = 0;
     uint8_t hillCaptureTeam = 0;
+    uint8_t hillContested = 0;
     float hillCaptureProgress = 0.0f;
     std::vector<AmmoPack> ammoPacks;
 };
@@ -381,9 +387,11 @@ void sendInput(ClientState& state) {
     packet.yaw = state.yaw;
     packet.pitch = state.pitch;
     packet.jumpPressed = state.jumpQueued ? 1 : 0;
+    packet.firePressed = state.fireQueued ? 1 : 0;
     packet.crouchHeld = (keyDown(KEY_LEFT_SHIFT) || keyDown(KEY_RIGHT_SHIFT)) ? 1 : 0;
     packet.weaponSlot = static_cast<uint8_t>(state.equippedWeapon);
     state.jumpQueued = false;
+    state.fireQueued = false;
 
     sendto(
         state.socket,
@@ -434,6 +442,8 @@ void pumpNetwork(ClientState& state) {
                 player.pitch = packet.players[i].pitch;
                 player.crouched = packet.players[i].crouched != 0;
                 player.teamId = packet.players[i].teamId;
+                player.health = packet.players[i].health;
+                player.dead = packet.players[i].dead != 0;
                 nextPlayers[packet.players[i].playerId] = player;
             }
             state.players = std::move(nextPlayers);
@@ -441,6 +451,7 @@ void pumpNetwork(ClientState& state) {
             state.team2Score = packet.team2Score;
             state.hillOwnerTeam = packet.hillOwnerTeam;
             state.hillCaptureTeam = packet.hillCaptureTeam;
+            state.hillContested = packet.hillContested;
             state.hillCaptureProgress = packet.hillCaptureProgress;
         }
     }
@@ -452,6 +463,8 @@ void syncLocalPosition(ClientState& state) {
         state.localPosition = it->second.position;
         state.localCrouched = it->second.crouched;
         state.localTeamId = it->second.teamId;
+        state.localHealth = it->second.health;
+        state.localDead = it->second.dead;
     }
 }
 
@@ -485,6 +498,9 @@ void drawRoom(const ClientState& state) {
 }
 
 void drawPlayerCapsule(const RemotePlayer& player) {
+    if (player.dead) {
+        return;
+    }
     const bool team1 = player.teamId == 1;
     const Color body = team1 ? Color{110, 170, 245, 255} : Color{245, 120, 120, 255};
     const Color outline = team1 ? Color{78, 124, 190, 255} : Color{185, 78, 78, 255};
@@ -507,6 +523,10 @@ void drawPlayerCapsule(const RemotePlayer& player) {
 }
 
 void updateViewmodelAndFootsteps(ClientState& state, double now, float dt) {
+    if (state.localDead) {
+        return;
+    }
+
     const bool moving = keyDown(KEY_W) || keyDown(KEY_A) || keyDown(KEY_S) || keyDown(KEY_D);
     const bool grounded = state.localPosition.y <= 0.05f;
     const bool knifeEquipped = state.equippedWeapon == WeaponSlot::Knife;
@@ -681,6 +701,10 @@ void updateWeaponAnimationState(ClientState& state, double now) {
 }
 
 void drawViewmodel(const ClientState& state, double now) {
+    if (state.localDead) {
+        return;
+    }
+
     const int frameIndex = weaponFrameIndex(state, now);
     const Texture2D* frame = nullptr;
     if (state.equippedWeapon == WeaponSlot::Knife) {
@@ -777,16 +801,23 @@ void render(ClientState& state, double now) {
     DrawText(("Weapon: " + weaponLabel).c_str(), 16, 42, 20, RAYWHITE);
     DrawText(ammoText.c_str(), 16, 68, 20, RAYWHITE);
     const std::string teamText = "Team " + std::to_string(state.localTeamId == 0 ? 1 : state.localTeamId) +
+        " | HP: " + std::to_string(state.localHealth) +
         " | KOTH score T1: " + std::to_string(state.team1Score) + "  T2: " + std::to_string(state.team2Score);
     DrawText(teamText.c_str(), 16, 94, 20, RAYWHITE);
     std::string hillText = "Hill: Neutral";
+    if (state.hillContested != 0) {
+        hillText = "Hill: Contested";
+    }
     if (state.hillOwnerTeam == 1) hillText = "Hill: Owned by Team 1";
     if (state.hillOwnerTeam == 2) hillText = "Hill: Owned by Team 2";
-    if (state.hillOwnerTeam == 0 && state.hillCaptureTeam != 0) {
+    if (state.hillContested == 0 && state.hillOwnerTeam == 0 && state.hillCaptureTeam != 0) {
         hillText = "Hill: Team " + std::to_string(state.hillCaptureTeam) + " capturing " +
             std::to_string(static_cast<int>(state.hillCaptureProgress * 100.0f)) + "%";
     }
     DrawText(hillText.c_str(), 16, 120, 20, Color{245, 235, 170, 255});
+    if (state.localDead) {
+        DrawText("You are dead - respawning...", GetScreenWidth() / 2 - 190, GetScreenHeight() / 2 - 70, 30, RED);
+    }
     DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | Shift crouch | 1 shotgun | 3 knife | LMB attack/fire | F inspect | Esc quit", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
     DrawFPS(GetScreenWidth() - 95, 12);
 
@@ -826,6 +857,9 @@ int main(int argc, char** argv) {
             }
 
             const float wheelMove = GetMouseWheelMove();
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                state.fireQueued = true;
+            }
             if (IsKeyPressed(KEY_SPACE)) {
                 state.jumpQueued = true;
             }

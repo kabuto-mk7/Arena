@@ -66,6 +66,7 @@ struct InputPacket {
     uint8_t jumpPressed;
     uint8_t crouchHeld;
     uint8_t weaponSlot;
+    uint8_t firePressed;
 };
 
 struct WelcomePacket {
@@ -82,6 +83,8 @@ struct PlayerStatePacket {
     float pitch;
     uint8_t crouched;
     uint8_t teamId;
+    uint8_t health;
+    uint8_t dead;
 };
 
 struct SnapshotPacket {
@@ -92,6 +95,7 @@ struct SnapshotPacket {
     uint16_t team2Score;
     uint8_t hillOwnerTeam;
     uint8_t hillCaptureTeam;
+    uint8_t hillContested;
     float hillCaptureProgress;
     PlayerStatePacket players[MaxPlayers];
 };

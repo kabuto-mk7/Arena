@@ -1,6 +1,7 @@
 #include "net.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -21,6 +22,14 @@ constexpr float SvFriction = 4.0f;
 constexpr float SvStopSpeed = 2.8f;
 constexpr float SvAirSpeedCap = 2.2f;
 constexpr float MaxBhopSpeedFactor = 1.45f;
+constexpr int MaxHealth = 100;
+constexpr float ShotgunRange = 36.0f;
+constexpr int ShotgunDamage = 34;
+constexpr float ShotgunFireInterval = 0.24f;
+constexpr float KnifeRange = 2.2f;
+constexpr int KnifeDamage = 45;
+constexpr float KnifeFireInterval = 0.35f;
+constexpr float RespawnDelaySeconds = 3.0f;
 
 struct Player {
     uint32_t id = 0;
@@ -36,6 +45,10 @@ struct Player {
     uint8_t teamId = 1;
     WeaponSlot equippedWeapon = WeaponSlot::Knife;
     float airborneSpeedMultiplier = 1.0f;
+    int health = MaxHealth;
+    bool dead = false;
+    double respawnAt = 0.0;
+    double nextFireAt = 0.0;
     double lastHeardAt = 0.0;
 };
 
@@ -46,6 +59,7 @@ struct HillState {
     uint16_t team2Score = 0;
     uint8_t ownerTeam = 0;
     uint8_t captureTeam = 0;
+    uint8_t contested = 0;
     float captureProgress = 0.0f;
     double nextScoreAt = 0.0;
 };
@@ -181,6 +195,10 @@ void sendWelcome(SOCKET socket, const Player& player) {
 }
 
 void integrateInput(Player& player, const arena::InputPacket& input) {
+    if (player.dead) {
+        return;
+    }
+
     const WeaponSlot inputWeapon = (input.weaponSlot == static_cast<uint8_t>(WeaponSlot::Shotgun)) ? WeaponSlot::Shotgun : WeaponSlot::Knife;
     player.equippedWeapon = inputWeapon;
     player.yaw = input.yaw;
@@ -267,12 +285,131 @@ void integrateInput(Player& player, const arena::InputPacket& input) {
     }
 }
 
+arena::Vec3 viewForward(float yaw, float pitch) {
+    return arena::normalize({
+        static_cast<float>(std::sin(yaw)) * static_cast<float>(std::cos(pitch)),
+        static_cast<float>(std::sin(pitch)),
+        -static_cast<float>(std::cos(yaw)) * static_cast<float>(std::cos(pitch)),
+    });
+}
+
+float eyeHeightForPlayer(const Player& player) {
+    return player.crouched ? arena::CrouchEyeHeight : arena::StandEyeHeight;
+}
+
+float currentHeightForPlayer(const Player& player) {
+    return player.crouched ? arena::CrouchHeight : arena::PlayerHeight;
+}
+
+bool rayHitsPlayerSphere(const arena::Vec3& origin, const arena::Vec3& dir, float maxDistance, const Player& target) {
+    const float h = currentHeightForPlayer(target);
+    const arena::Vec3 center{target.position.x, target.position.y + h * 0.5f, target.position.z};
+    const float radius = arena::PlayerRadius + 0.18f;
+    const arena::Vec3 toCenter = center - origin;
+    const float t = arena::dot(toCenter, dir);
+    if (t < 0.0f || t > maxDistance) {
+        return false;
+    }
+    const arena::Vec3 closest = origin + dir * t;
+    const arena::Vec3 delta = center - closest;
+    return arena::dot(delta, delta) <= radius * radius;
+}
+
+void processCombatInput(Player& attacker, std::vector<Player>& players, const arena::InputPacket& input, double now) {
+    if (attacker.dead || input.firePressed == 0 || now < attacker.nextFireAt) {
+        return;
+    }
+
+    const arena::Vec3 origin{
+        attacker.position.x,
+        attacker.position.y + eyeHeightForPlayer(attacker),
+        attacker.position.z
+    };
+    const arena::Vec3 dir = viewForward(attacker.yaw, attacker.pitch);
+
+    float range = ShotgunRange;
+    int damage = ShotgunDamage;
+    if (attacker.equippedWeapon == WeaponSlot::Knife) {
+        range = KnifeRange;
+        damage = KnifeDamage;
+        attacker.nextFireAt = now + KnifeFireInterval;
+    } else {
+        attacker.nextFireAt = now + ShotgunFireInterval;
+    }
+
+    Player* bestTarget = nullptr;
+    float bestDistance = range;
+    for (Player& target : players) {
+        if (target.id == attacker.id || target.dead || target.teamId == attacker.teamId) {
+            continue;
+        }
+        if (rayHitsPlayerSphere(origin, dir, range, target)) {
+            const arena::Vec3 toTarget = target.position - attacker.position;
+            const float dist = arena::length(toTarget);
+            if (dist < bestDistance) {
+                bestDistance = dist;
+                bestTarget = &target;
+            }
+        }
+    }
+
+    if (bestTarget == nullptr) {
+        return;
+    }
+
+    bestTarget->health = std::max(0, bestTarget->health - damage);
+    if (bestTarget->health == 0) {
+        bestTarget->dead = true;
+        bestTarget->respawnAt = now + RespawnDelaySeconds;
+        bestTarget->velocity = {};
+        bestTarget->velocityY = 0.0f;
+    }
+}
+
+void processRespawns(std::vector<Player>& players, double now) {
+    int team1Count = 0;
+    int team2Count = 0;
+    for (const Player& p : players) {
+        if (p.teamId == 1) team1Count++;
+        if (p.teamId == 2) team2Count++;
+    }
+    int team1SpawnIndex = 0;
+    int team2SpawnIndex = 0;
+
+    for (Player& player : players) {
+        if (!player.dead || now < player.respawnAt) {
+            continue;
+        }
+        player.dead = false;
+        player.health = MaxHealth;
+        player.velocity = {};
+        player.velocityY = 0.0f;
+        player.nextFireAt = now + 0.2;
+        player.wasForwardHeld = false;
+        player.airborneSpeedMultiplier = 1.0f;
+        player.grounded = true;
+
+        if (player.teamId == 1) {
+            const float z = -12.0f + static_cast<float>(team1SpawnIndex % std::max(1, team1Count)) * 4.0f;
+            player.position = {-16.0f, 0.0f, z};
+            team1SpawnIndex++;
+        } else {
+            const float z = -12.0f + static_cast<float>(team2SpawnIndex % std::max(1, team2Count)) * 4.0f;
+            player.position = {16.0f, 0.0f, z};
+            team2SpawnIndex++;
+        }
+    }
+}
+
 void updateHillState(HillState& hill, const std::vector<Player>& players, double now) {
     int team1OnHill = 0;
     int team2OnHill = 0;
 
     const float radiusSq = hill.radius * hill.radius;
     for (const Player& player : players) {
+        if (player.dead) {
+            continue;
+        }
         const float dx = player.position.x - hill.center.x;
         const float dz = player.position.z - hill.center.z;
         const float distSq = dx * dx + dz * dz;
@@ -287,6 +424,7 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
     }
 
     uint8_t capturingTeam = 0;
+    hill.contested = (team1OnHill > 0 && team2OnHill > 0) ? 1 : 0;
     if (team1OnHill > 0 && team2OnHill == 0) {
         capturingTeam = 1;
     } else if (team2OnHill > 0 && team1OnHill == 0) {
@@ -296,7 +434,9 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
     constexpr float captureTimeSeconds = 8.0f;
     const float delta = arena::TickSeconds / captureTimeSeconds;
 
-    if (capturingTeam == 0) {
+    if (hill.contested != 0) {
+        // Contested point: freeze progress exactly where it is.
+    } else if (capturingTeam == 0) {
         if (hill.ownerTeam == 0 && hill.captureProgress > 0.0f) {
             hill.captureProgress = std::max(0.0f, hill.captureProgress - delta * 0.5f);
             if (hill.captureProgress == 0.0f) {
@@ -326,7 +466,7 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
         }
     }
 
-    if (hill.ownerTeam != 0 && capturingTeam == hill.ownerTeam && now >= hill.nextScoreAt) {
+    if (hill.contested == 0 && hill.ownerTeam != 0 && capturingTeam == hill.ownerTeam && now >= hill.nextScoreAt) {
         if (hill.ownerTeam == 1) {
             hill.team1Score++;
         } else if (hill.ownerTeam == 2) {
@@ -345,6 +485,7 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
     packet.team2Score = hill.team2Score;
     packet.hillOwnerTeam = hill.ownerTeam;
     packet.hillCaptureTeam = hill.captureTeam;
+    packet.hillContested = hill.contested;
     packet.hillCaptureProgress = hill.captureProgress;
 
     for (uint32_t i = 0; i < packet.playerCount; ++i) {
@@ -356,10 +497,11 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
         packet.players[i].pitch = players[i].pitch;
         packet.players[i].crouched = players[i].crouched ? 1 : 0;
         packet.players[i].teamId = players[i].teamId;
+        packet.players[i].health = static_cast<uint8_t>(std::clamp(players[i].health, 0, MaxHealth));
+        packet.players[i].dead = players[i].dead ? 1 : 0;
     }
 
-    const int bytes = static_cast<int>(sizeof(arena::PacketHeader) + sizeof(uint32_t) * 2 + sizeof(uint16_t) * 2 + sizeof(uint8_t) * 2 + sizeof(float) +
-        sizeof(arena::PlayerStatePacket) * packet.playerCount);
+    const int bytes = static_cast<int>(offsetof(arena::SnapshotPacket, players) + sizeof(arena::PlayerStatePacket) * packet.playerCount);
     for (const auto& player : players) {
         sendto(
             socket,
@@ -435,6 +577,7 @@ int main(int argc, char** argv) {
                         player.address = from;
                         player.position = {static_cast<float>((player.id % 8) * 2), 0.0f, 0.0f};
                         player.teamId = (players.size() % 2 == 0) ? 1 : 2;
+                        player.health = MaxHealth;
                         player.lastHeardAt = arena::secondsNow();
                         players.push_back(player);
                         existing = &players.back();
@@ -452,6 +595,7 @@ int main(int argc, char** argv) {
                     if (player != nullptr) {
                         player->lastHeardAt = arena::secondsNow();
                         integrateInput(*player, input);
+                        processCombatInput(*player, players, input, arena::secondsNow());
                     }
                 }
             }
@@ -464,6 +608,7 @@ int main(int argc, char** argv) {
                     }),
                     players.end());
 
+                processRespawns(players, now);
                 updateHillState(hill, players, now);
                 broadcastSnapshot(socket, players, serverTick++, hill);
                 nextTickAt += arena::TickSeconds;
