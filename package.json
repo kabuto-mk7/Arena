@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "fbx2gltf": "^0.9.7-p1"
+  }
+}

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
@@ -49,6 +50,7 @@ constexpr float RespawnDelaySeconds = 3.0f;
 struct StaticSolid {
     arena::Vec3 center{};
     arena::Vec3 size{};
+    bool isRamp = false;
 };
 
 struct ServerMap {
@@ -112,7 +114,7 @@ ServerMap& worldMap() {
             }
             const float cx = map.originX + static_cast<float>(x) * map.cellSize;
             const float cz = map.originZ + static_cast<float>(z) * map.cellSize;
-            map.solids.push_back({{cx, solidHeight * 0.5f, cz}, {map.cellSize * 0.95f, solidHeight, map.cellSize * 0.95f}});
+            map.solids.push_back({{cx, solidHeight * 0.5f, cz}, {map.cellSize * 0.95f, solidHeight, map.cellSize * 0.95f}, symbol == 'R'});
         }
     }
     return map;
@@ -130,6 +132,21 @@ bool horizontalCircleOverlapsBox(const arena::Vec3& pos, float radius, const Sta
     return (dx * dx + dz * dz) <= (radius * radius);
 }
 
+float rampSurfaceYAt(const StaticSolid& s, float x, float z) {
+    const float minX = s.center.x - s.size.x * 0.5f;
+    const float maxX = s.center.x + s.size.x * 0.5f;
+    const float minZ = s.center.z - s.size.z * 0.5f;
+    const float maxZ = s.center.z + s.size.z * 0.5f;
+    const float clampedX = arena::clamp(x, minX, maxX);
+    const float clampedZ = arena::clamp(z, minZ, maxZ);
+    (void)clampedZ; // Keeps interface generic if ramp orientation changes later.
+
+    const float t = (maxX > minX) ? (clampedX - minX) / (maxX - minX) : 0.0f;
+    const float minY = s.center.y - s.size.y * 0.5f;
+    const float maxY = s.center.y + s.size.y * 0.5f;
+    return minY + t * (maxY - minY);
+}
+
 void resolveHorizontalMapCollisions(arena::Vec3& position, arena::Vec3& velocity, float currentHeight) {
     const float radius = arena::PlayerRadius;
     const float playerBottom = position.y;
@@ -140,6 +157,12 @@ void resolveHorizontalMapCollisions(arena::Vec3& position, arena::Vec3& velocity
         for (const StaticSolid& s : worldMap().solids) {
             const float minY = s.center.y - s.size.y * 0.5f;
             const float maxY = s.center.y + s.size.y * 0.5f;
+            if (s.isRamp) {
+                const float rampY = rampSurfaceYAt(s, position.x, position.z);
+                if (playerBottom >= rampY - 0.01f) {
+                    continue;
+                }
+            }
             if (playerTop <= minY || playerBottom >= maxY) {
                 continue;
             }
@@ -189,6 +212,15 @@ bool resolveVerticalMapCollisions(arena::Vec3& position, float& velocityY, float
         if (!horizontalCircleOverlapsBox(position, radius, s)) {
             continue;
         }
+        if (s.isRamp) {
+            const float rampY = rampSurfaceYAt(s, position.x, position.z);
+            if (velocityY <= 0.0f && prevY >= rampY && position.y <= rampY) {
+                position.y = rampY;
+                velocityY = 0.0f;
+                landed = true;
+            }
+            continue;
+        }
         const float minY = s.center.y - s.size.y * 0.5f;
         const float maxY = s.center.y + s.size.y * 0.5f;
 
@@ -212,6 +244,7 @@ bool resolveVerticalMapCollisions(arena::Vec3& position, float& velocityY, float
 struct Player {
     uint32_t id = 0;
     sockaddr_in address{};
+    std::string name = "Player";
     arena::Vec3 position{};
     arena::Vec3 velocity{};
     float velocityY = 0.0f;
@@ -239,6 +272,11 @@ struct Player {
     arena::Vec3 lgBeamEnd{};
     double lastHeardAt = 0.0;
     bool mapSent = false;
+    uint32_t lastAckedServerTick = 0;
+    uint16_t pingMs = 0;
+    uint16_t kills = 0;
+    uint16_t deaths = 0;
+    uint32_t damageDealt = 0;
 };
 
 struct HillState {
@@ -395,10 +433,64 @@ Player* findPlayer(std::vector<Player>& players, const sockaddr_in& address) {
     return nullptr;
 }
 
+std::string trimName(const std::string& raw) {
+    size_t start = 0;
+    while (start < raw.size() && std::isspace(static_cast<unsigned char>(raw[start])) != 0) {
+        start++;
+    }
+    size_t end = raw.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(raw[end - 1])) != 0) {
+        end--;
+    }
+    std::string out = raw.substr(start, end - start);
+    if (out.empty()) {
+        out = "Player";
+    }
+    if (out.size() >= static_cast<size_t>(arena::MaxPlayerNameChars)) {
+        out.resize(arena::MaxPlayerNameChars - 1);
+    }
+    return out;
+}
+
+bool isNameTaken(const std::vector<Player>& players, const std::string& candidate) {
+    for (const Player& p : players) {
+        if (p.name == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string uniqueJoinName(const std::vector<Player>& players, const std::string& requestedRaw) {
+    const std::string base = trimName(requestedRaw);
+    if (!isNameTaken(players, base)) {
+        return base;
+    }
+    for (int suffix = 2; suffix < 10000; ++suffix) {
+        std::string candidate = base + " " + std::to_string(suffix);
+        if (candidate.size() >= static_cast<size_t>(arena::MaxPlayerNameChars)) {
+            const std::string suffixText = " " + std::to_string(suffix);
+            size_t maxBaseLen = static_cast<size_t>(arena::MaxPlayerNameChars - 1);
+            if (suffixText.size() < maxBaseLen) {
+                maxBaseLen -= suffixText.size();
+            } else {
+                maxBaseLen = 1;
+            }
+            candidate = base.substr(0, maxBaseLen) + suffixText;
+        }
+        if (!isNameTaken(players, candidate)) {
+            return candidate;
+        }
+    }
+    return base;
+}
+
 void sendWelcome(SOCKET socket, const Player& player) {
     arena::WelcomePacket packet{};
     packet.header = arena::makeHeader(arena::PacketType::Welcome);
     packet.playerId = player.id;
+    std::memset(packet.assignedName, 0, sizeof(packet.assignedName));
+    std::memcpy(packet.assignedName, player.name.c_str(), std::min(player.name.size(), sizeof(packet.assignedName) - 1));
 
     sendto(
         socket,
@@ -713,15 +805,20 @@ bool processCombatInput(Player& attacker, std::vector<Player>& players, const ar
         return true;
     }
 
+    const int previousHealth = bestTarget->health;
     bestTarget->health = std::max(0, bestTarget->health - damage);
+    const int damageApplied = std::max(0, previousHealth - bestTarget->health);
     attacker.hitConfirmCount++;
-    attacker.lastDamageDealt = static_cast<uint8_t>(std::clamp(damage, 0, 255));
+    attacker.lastDamageDealt = static_cast<uint8_t>(std::clamp(damageApplied, 0, 255));
     attacker.lastHitTargetId = bestTarget->id;
+    attacker.damageDealt += static_cast<uint32_t>(damageApplied);
     if (bestTarget->health == 0) {
         bestTarget->dead = true;
         bestTarget->respawnAt = now + RespawnDelaySeconds;
         bestTarget->velocity = {};
         bestTarget->velocityY = 0.0f;
+        attacker.kills = static_cast<uint16_t>(std::min<int>(65535, attacker.kills + 1));
+        bestTarget->deaths = static_cast<uint16_t>(std::min<int>(65535, bestTarget->deaths + 1));
     }
     return true;
 }
@@ -905,6 +1002,8 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
     const double snapshotNow = arena::secondsNow();
     for (uint32_t i = 0; i < packet.playerCount; ++i) {
         packet.players[i].playerId = players[i].id;
+        std::memset(packet.players[i].name, 0, sizeof(packet.players[i].name));
+        std::memcpy(packet.players[i].name, players[i].name.c_str(), std::min(players[i].name.size(), sizeof(packet.players[i].name) - 1));
         packet.players[i].x = players[i].position.x;
         packet.players[i].y = players[i].position.y;
         packet.players[i].z = players[i].position.z;
@@ -923,6 +1022,10 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
         packet.players[i].hitConfirmCount = players[i].hitConfirmCount;
         packet.players[i].lastDamageDealt = players[i].lastDamageDealt;
         packet.players[i].lastHitTargetId = players[i].lastHitTargetId;
+        packet.players[i].pingMs = players[i].pingMs;
+        packet.players[i].kills = players[i].kills;
+        packet.players[i].deaths = players[i].deaths;
+        packet.players[i].damageDealt = players[i].damageDealt;
     }
 
     const int bytes = static_cast<int>(offsetof(arena::SnapshotPacket, players) + sizeof(arena::PlayerStatePacket) * packet.playerCount);
@@ -994,6 +1097,12 @@ int main(int argc, char** argv) {
                 }
 
                 if (arena::hasValidHeader(buffer, received, arena::PacketType::Hello)) {
+                    arena::HelloPacket hello{};
+                    if (received >= static_cast<int>(sizeof(arena::HelloPacket))) {
+                        std::memcpy(&hello, buffer, sizeof(hello));
+                    } else {
+                        hello.header = arena::makeHeader(arena::PacketType::Hello);
+                    }
                     Player* existing = findPlayer(players, from);
                     if (existing == nullptr && players.size() < arena::MaxPlayers) {
                         Player player{};
@@ -1003,9 +1112,10 @@ int main(int argc, char** argv) {
                         player.teamId = (players.size() % 2 == 0) ? 1 : 2;
                         player.health = MaxHealth;
                         player.lastHeardAt = arena::secondsNow();
+                        player.name = uniqueJoinName(players, std::string(hello.desiredName));
                         players.push_back(player);
                         existing = &players.back();
-                        std::cout << "Player " << existing->id << " joined from " << arena::addressToString(from)
+                        std::cout << "Player " << existing->id << " (" << existing->name << ") joined from " << arena::addressToString(from)
                                   << " (team " << static_cast<int>(existing->teamId) << ")\n";
                     }
                     if (existing != nullptr) {
@@ -1023,6 +1133,12 @@ int main(int argc, char** argv) {
                     if (player != nullptr) {
                         const double now = arena::secondsNow();
                         player->lastHeardAt = now;
+                        if (input.lastReceivedServerTick <= serverTick) {
+                            const uint32_t deltaTicks = serverTick - input.lastReceivedServerTick;
+                            const uint32_t estimatedMs = static_cast<uint32_t>(std::round(static_cast<double>(deltaTicks) * arena::TickSeconds * 1000.0));
+                            player->pingMs = static_cast<uint16_t>(std::min<uint32_t>(estimatedMs, 65535));
+                            player->lastAckedServerTick = input.lastReceivedServerTick;
+                        }
                         integrateInput(*player, input, now);
                         const bool performedAction = processCombatInput(*player, players, input, now);
                         if (performedAction && !player->grounded && player->jumpedSinceGround) {

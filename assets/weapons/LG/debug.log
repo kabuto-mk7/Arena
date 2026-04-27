@@ -1,1 +1,2 @@
 [0426/173021.924:WARNING:dns_config_service_win.cc(715)] Failed to read DnsHosts.
+[0426/185059.206:ERROR:browser_gpu_channel_host_factory.cc(139)] Failed to launch GPU process.

@@ -26,6 +26,7 @@ namespace arena {
 constexpr uint32_t ProtocolMagic = 0x41524650; // ARFP
 constexpr uint16_t DefaultPort = 40000;
 constexpr int MaxPlayers = 32;
+constexpr int MaxPlayerNameChars = 24;
 constexpr int MapMaxWidth = 32;
 constexpr int MapMaxHeight = 32;
 constexpr float TickSeconds = 1.0f / 60.0f;
@@ -57,6 +58,7 @@ struct PacketHeader {
 
 struct HelloPacket {
     PacketHeader header;
+    char desiredName[MaxPlayerNameChars];
 };
 
 struct InputPacket {
@@ -74,11 +76,13 @@ struct InputPacket {
     uint8_t dashPressed;
     int8_t dashMoveX;
     int8_t dashMoveZ;
+    uint32_t lastReceivedServerTick;
 };
 
 struct WelcomePacket {
     PacketHeader header;
     uint32_t playerId;
+    char assignedName[MaxPlayerNameChars];
 };
 
 struct MapDataPacket {
@@ -93,6 +97,7 @@ struct MapDataPacket {
 
 struct PlayerStatePacket {
     uint32_t playerId;
+    char name[MaxPlayerNameChars];
     float x;
     float y;
     float z;
@@ -111,6 +116,10 @@ struct PlayerStatePacket {
     uint16_t hitConfirmCount;
     uint8_t lastDamageDealt;
     uint32_t lastHitTargetId;
+    uint16_t pingMs;
+    uint16_t kills;
+    uint16_t deaths;
+    uint32_t damageDealt;
 };
 
 struct SnapshotPacket {

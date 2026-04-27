@@ -2,13 +2,16 @@
 
 #include <raylib.h>
 #include <raymath.h>
+#include <rlgl.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
 #include <iostream>
+#include <initializer_list>
 #include <map>
 #include <string>
 #include <vector>
@@ -62,6 +65,7 @@ enum class ScreenMode {
 };
 
 struct RemotePlayer {
+    std::string name = "Player";
     arena::Vec3 position{};
     float yaw = 0.0f;
     float pitch = 0.0f;
@@ -76,7 +80,94 @@ struct RemotePlayer {
     uint16_t hitConfirmCount = 0;
     uint8_t lastDamageDealt = 0;
     uint32_t lastHitTargetId = 0;
+    uint16_t pingMs = 0;
+    uint16_t kills = 0;
+    uint16_t deaths = 0;
+    uint32_t damageDealt = 0;
 };
+
+enum class EnemyAnimClip {
+    Idle = 0,
+    WalkForward,
+    RunForward,
+    RunBackward,
+    StrafeLeft,
+    StrafeRight,
+    Jump,
+    HitReact,
+    Count
+};
+
+struct EnemyAnimState {
+    arena::Vec3 lastPosition{};
+    bool hasLastPosition = false;
+    float estimatedSpeed = 0.0f;
+    bool wasAirborne = false;
+    EnemyAnimClip activeClip = EnemyAnimClip::Idle;
+    float frame = 0.0f;
+};
+
+struct EnemyClipAsset {
+    Model model{};
+    bool modelLoaded = false;
+    float modelScale = 1.0f;
+    float modelMinY = 0.0f;
+    float modelCenterX = 0.0f;
+    float modelCenterZ = 0.0f;
+    ModelAnimation* anims = nullptr;
+    int animCount = 0;
+    bool animValidForModel = false;
+};
+
+void forceVisibleMaterial(Model& model) {
+    for (int i = 0; i < model.materialCount; ++i) {
+        // Keep imported albedo textures; only ensure visible tint defaults.
+        if (model.materials[i].maps[MATERIAL_MAP_ALBEDO].texture.id == 0) {
+            model.materials[i].maps[MATERIAL_MAP_ALBEDO].color = Color{255, 120, 120, 255};
+        } else {
+            model.materials[i].maps[MATERIAL_MAP_ALBEDO].color = WHITE;
+        }
+        model.materials[i].maps[MATERIAL_MAP_EMISSION].color = Color{0, 0, 0, 255};
+    }
+}
+
+void drawModelEuler(const Model& model, Vector3 position, Vector3 rotationDeg, Vector3 scale, Color tint) {
+    rlPushMatrix();
+    rlTranslatef(position.x, position.y, position.z);
+    rlRotatef(rotationDeg.y, 0.0f, 1.0f, 0.0f);
+    rlRotatef(rotationDeg.x, 1.0f, 0.0f, 0.0f);
+    rlRotatef(rotationDeg.z, 0.0f, 0.0f, 1.0f);
+    rlScalef(scale.x, scale.y, scale.z);
+    // Use DrawModel on identity-local origin so raylib handles full model/material/shader path.
+    DrawModel(model, Vector3{0.0f, 0.0f, 0.0f}, 1.0f, tint);
+    rlPopMatrix();
+}
+
+BoundingBox getModelBounds(const Model& model) {
+    if (model.meshCount <= 0 || model.meshes == nullptr) {
+        return BoundingBox{Vector3{0.0f, 0.0f, 0.0f}, Vector3{0.0f, 0.0f, 0.0f}};
+    }
+    BoundingBox merged = GetMeshBoundingBox(model.meshes[0]);
+    for (int i = 1; i < model.meshCount; ++i) {
+        const BoundingBox b = GetMeshBoundingBox(model.meshes[i]);
+        merged.min.x = std::min(merged.min.x, b.min.x);
+        merged.min.y = std::min(merged.min.y, b.min.y);
+        merged.min.z = std::min(merged.min.z, b.min.z);
+        merged.max.x = std::max(merged.max.x, b.max.x);
+        merged.max.y = std::max(merged.max.y, b.max.y);
+        merged.max.z = std::max(merged.max.z, b.max.z);
+    }
+    return merged;
+}
+
+float computeEnemyModelScale(const BoundingBox& bounds) {
+    const float sx = std::max(0.000001f, bounds.max.x - bounds.min.x);
+    const float sy = std::max(0.000001f, bounds.max.y - bounds.min.y);
+    const float sz = std::max(0.000001f, bounds.max.z - bounds.min.z);
+    const float dominant = std::max(sx, std::max(sy, sz));
+    // Use dominant axis so prone/leaning source poses don't explode scale from tiny Y-height.
+    return arena::PlayerHeight / dominant;
+}
 
 struct AmmoPack {
     Vector3 position{};
@@ -102,7 +193,11 @@ struct ClientState {
     float hitSoundVolume = 0.65f;
     double mainMenuOpenedAt = 0.0;
     uint32_t localPlayerId = 0;
+    std::string localPlayerName = "Player";
+    std::string desiredJoinName = "Player";
+    bool joinNameActive = false;
     uint32_t inputSequence = 0;
+    uint32_t latestServerTick = 0;
     arena::Vec3 localPosition{0.0f, 0.0f, -6.0f};
     arena::Vec3 smoothedRenderPosition{0.0f, 0.0f, -6.0f};
     bool smoothedRenderPositionInitialized = false;
@@ -139,6 +234,17 @@ struct ClientState {
     Model ceilingModel{};
     Model wallModelX{};
     Model wallModelZ{};
+    std::array<EnemyClipAsset, static_cast<size_t>(EnemyAnimClip::Count)> enemyClipAssets{};
+    bool enemyAnimSetReady = false;
+    std::string enemyAnimStatus = "enemy anim: not initialized";
+    std::string enemyModelDebug = "enemy model debug: n/a";
+    float enemyTuneScale = 1.2f;
+    float enemyTuneOffsetX = 0.0f;
+    float enemyTuneOffsetY = -0.3f;
+    float enemyTuneOffsetZ = 1.2f;
+    float enemyTuneRotX = 270.0f;
+    float enemyTuneRotY = 180.0f;
+    float enemyTuneRotZ = 0.0f;
 
     Sound shotgunFire{};
     Sound shotgunEmpty{};
@@ -201,6 +307,7 @@ struct ClientState {
     std::vector<DamagePopup> damagePopups;
     std::map<uint32_t, uint8_t> enemyPrevFiring;
     std::map<uint32_t, double> enemyNextFireSoundAt;
+    std::map<uint32_t, EnemyAnimState> enemyAnimStateById;
     float damageFlash = 0.0f;
     bool mapLoaded = false;
     uint16_t mapWidth = 0;
@@ -252,6 +359,25 @@ std::string formatClock(uint16_t secondsLeft) {
     return std::string(buffer);
 }
 
+std::string trimForJoinName(const std::string& raw) {
+    size_t start = 0;
+    while (start < raw.size() && std::isspace(static_cast<unsigned char>(raw[start])) != 0) {
+        start++;
+    }
+    size_t end = raw.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(raw[end - 1])) != 0) {
+        end--;
+    }
+    std::string out = raw.substr(start, end - start);
+    if (out.empty()) {
+        out = "Player";
+    }
+    if (out.size() >= static_cast<size_t>(arena::MaxPlayerNameChars)) {
+        out.resize(arena::MaxPlayerNameChars - 1);
+    }
+    return out;
+}
+
 void drawTextureCover(const Texture2D& texture, int screenWidth, int screenHeight, Color tint) {
     if (texture.id == 0 || texture.width <= 0 || texture.height <= 0) {
         return;
@@ -287,6 +413,122 @@ std::string resolveAssetPath(const std::string& relativePath) {
         }
     }
     throw std::runtime_error("Missing asset: " + relativePath);
+}
+
+float firstAnimFpsOrDefault(const ModelAnimation* anim, int count) {
+    if (anim == nullptr || count <= 0 || anim[0].frameCount <= 1) {
+        return 30.0f;
+    }
+    return 30.0f;
+}
+
+bool loadEnemyAnimClip(const std::string& path, ModelAnimation*& outAnims, int& outCount) {
+    outAnims = nullptr;
+    outCount = 0;
+    const std::string resolved = resolveAssetPath(path);
+    outAnims = LoadModelAnimations(resolved.c_str(), &outCount);
+    return outAnims != nullptr && outCount > 0;
+}
+
+std::string resolveAssetPathIfExists(const std::string& relativePath) {
+    static const std::array<const char*, 5> prefixes = {"", ".\\", "..\\", "..\\..\\", "..\\..\\..\\"};
+    for (const char* prefix : prefixes) {
+        const std::string candidate = std::string(prefix) + relativePath;
+        if (FileExists(candidate.c_str())) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+std::string resolvePreferredAnimAsset(const char* stemNoExt) {
+    const std::array<const char*, 4> extensions = {".glb", ".gltf", ".iqm", ".fbx"};
+    for (const char* ext : extensions) {
+        const std::string rel = std::string("assets\\") + stemNoExt + ext;
+        const std::string found = resolveAssetPathIfExists(rel);
+        if (!found.empty()) {
+            return found;
+        }
+    }
+    return {};
+}
+
+void initEnemyModelAssets(ClientState& state) {
+    state.enemyAnimSetReady = false;
+    state.enemyAnimStatus = "enemy anim: loading";
+    for (EnemyClipAsset& clip : state.enemyClipAssets) {
+        clip.model = {};
+        clip.modelLoaded = false;
+        clip.modelScale = 1.0f;
+        clip.modelMinY = 0.0f;
+        clip.modelCenterX = 0.0f;
+        clip.modelCenterZ = 0.0f;
+        clip.anims = nullptr;
+        clip.animCount = 0;
+        clip.animValidForModel = false;
+    }
+
+    try {
+        int loadedCount = 0;
+        auto tryLoad = [&](EnemyAnimClip clipType, const char* stemNoExt) {
+            const std::string path = resolvePreferredAnimAsset(stemNoExt);
+            if (path.empty()) {
+                return;
+            }
+            EnemyClipAsset& clip = state.enemyClipAssets[static_cast<size_t>(clipType)];
+            clip.model = LoadModel(path.c_str());
+            clip.modelLoaded = clip.model.meshCount > 0;
+            if (!clip.modelLoaded) {
+                return;
+            }
+            forceVisibleMaterial(clip.model);
+            BoundingBox bounds = getModelBounds(clip.model);
+            clip.modelMinY = bounds.min.y;
+            clip.modelCenterX = (bounds.min.x + bounds.max.x) * 0.5f;
+            clip.modelCenterZ = (bounds.min.z + bounds.max.z) * 0.5f;
+            clip.modelScale = computeEnemyModelScale(bounds);
+
+            clip.anims = LoadModelAnimations(path.c_str(), &clip.animCount);
+            const bool ok = clip.anims != nullptr && clip.animCount > 0;
+            if (ok) {
+                clip.animValidForModel = IsModelAnimationValid(clip.model, clip.anims[0]);
+                if (clip.animValidForModel) {
+                    loadedCount++;
+                }
+            }
+        };
+        auto tryLoadFirst = [&](EnemyAnimClip clipType, std::initializer_list<const char*> stems) {
+            for (const char* stem : stems) {
+                tryLoad(clipType, stem);
+                const EnemyClipAsset& clip = state.enemyClipAssets[static_cast<size_t>(clipType)];
+                if (clip.modelLoaded) {
+                    return;
+                }
+            }
+        };
+
+        // Preferred hand-converted GLB names in /assets, with legacy-name fallbacks.
+        tryLoadFirst(EnemyAnimClip::Idle, {"rifleIdle", "rifledle", "Rifle Idle"});
+        // No dedicated walk clip required: reuse run forward.
+        tryLoadFirst(EnemyAnimClip::WalkForward, {"runForward", "Walk Forward"});
+        tryLoadFirst(EnemyAnimClip::RunForward, {"runForward", "Run Forward"});
+        tryLoadFirst(EnemyAnimClip::RunBackward, {"jumpBackwards", "Run Backwards"});
+        tryLoadFirst(EnemyAnimClip::StrafeLeft, {"walkLeft", "Strafe Left"});
+        tryLoadFirst(EnemyAnimClip::StrafeRight, {"runRight", "Strafe Right"});
+        tryLoadFirst(EnemyAnimClip::Jump, {"rifleJump", "Rifle Jump"});
+        tryLoadFirst(EnemyAnimClip::HitReact, {"HitReaction", "Hit Reaction"});
+
+        // Only idle is mandatory. Missing clips gracefully fall back at runtime.
+        const EnemyClipAsset& idle = state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
+        const bool hasIdle = idle.modelLoaded && idle.anims != nullptr && idle.animCount > 0 && idle.animValidForModel;
+        state.enemyAnimSetReady = hasIdle;
+        state.enemyAnimStatus = state.enemyAnimSetReady
+            ? ("enemy anim: model+clips ready (" + std::to_string(loadedCount) + "/8)")
+            : "enemy anim: idle anim invalid for model";
+    } catch (...) {
+        state.enemyAnimSetReady = false;
+        state.enemyAnimStatus = "enemy anim: init threw exception";
+    }
 }
 
 Texture2D loadTextureAsset(const std::string& relativePath) {
@@ -372,6 +614,7 @@ void initAssets(ClientState& state) {
     state.ceilingModel.materials[0].maps[MATERIAL_MAP_ALBEDO].texture = state.wallTexture;
     state.wallModelX.materials[0].maps[MATERIAL_MAP_ALBEDO].texture = state.wallTexture;
     state.wallModelZ.materials[0].maps[MATERIAL_MAP_ALBEDO].texture = state.wallTexture;
+    initEnemyModelAssets(state);
 
     static const std::array<const char*, 8> shotgunFrameFiles = {
         "assets\\weapons\\doubleshotgun\\idle.png",
@@ -552,6 +795,18 @@ void unloadAssets(ClientState& state) {
     UnloadModel(state.ceilingModel);
     UnloadModel(state.wallModelX);
     UnloadModel(state.wallModelZ);
+    for (EnemyClipAsset& clip : state.enemyClipAssets) {
+        if (clip.anims != nullptr && clip.animCount > 0) {
+            UnloadModelAnimations(clip.anims, clip.animCount);
+            clip.anims = nullptr;
+            clip.animCount = 0;
+        }
+        if (clip.modelLoaded) {
+            UnloadModel(clip.model);
+            clip.modelLoaded = false;
+        }
+    }
+    state.enemyAnimSetReady = false;
 
     UnloadTexture(state.wallTexture);
     UnloadTexture(state.floorTexture);
@@ -626,6 +881,9 @@ void updateLightningAudio(ClientState& state) {
 void sendHello(ClientState& state) {
     arena::HelloPacket packet{};
     packet.header = arena::makeHeader(arena::PacketType::Hello);
+    std::memset(packet.desiredName, 0, sizeof(packet.desiredName));
+    const std::string cleaned = trimForJoinName(state.desiredJoinName);
+    std::memcpy(packet.desiredName, cleaned.c_str(), std::min(cleaned.size(), sizeof(packet.desiredName) - 1));
     sendto(
         state.socket,
         reinterpret_cast<const char*>(&packet),
@@ -706,6 +964,34 @@ void drawMainMenu(ClientState& state) {
         {columnX, baseY + 184.0f, columnW, 68.0f}
     };
 
+    Rectangle nameField{columnX, baseY - 96.0f, columnW, 58.0f};
+    const Vector2 mouse = GetMousePosition();
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        state.joinNameActive = CheckCollisionPointRec(mouse, nameField);
+    }
+    if (state.joinNameActive) {
+        int codepoint = GetCharPressed();
+        while (codepoint > 0) {
+            const bool printableAscii = codepoint >= 32 && codepoint <= 126;
+            if (printableAscii && state.desiredJoinName.size() < static_cast<size_t>(arena::MaxPlayerNameChars - 1)) {
+                state.desiredJoinName.push_back(static_cast<char>(codepoint));
+            }
+            codepoint = GetCharPressed();
+        }
+        if (IsKeyPressed(KEY_BACKSPACE) && !state.desiredJoinName.empty()) {
+            state.desiredJoinName.pop_back();
+        }
+    }
+
+    DrawRectangleRounded(nameField, 0.18f, 8, Color{15, 20, 30, 195});
+    DrawRectangleRoundedLinesEx(nameField, 0.18f, 8, 2.0f, state.joinNameActive ? Color{255, 219, 160, 255} : Color{130, 146, 170, 220});
+    DrawText("Name", static_cast<int>(nameField.x + 14.0f), static_cast<int>(nameField.y - 30.0f), 24, Color{214, 220, 232, 240});
+    std::string shownName = state.desiredJoinName.empty() ? "Player" : state.desiredJoinName;
+    if (state.joinNameActive && (static_cast<int>(GetTime() * 2.0) % 2 == 0) && shownName.size() < static_cast<size_t>(arena::MaxPlayerNameChars - 1)) {
+        shownName.push_back('_');
+    }
+    DrawText(shownName.c_str(), static_cast<int>(nameField.x + 14.0f), static_cast<int>(nameField.y + 14.0f), 28, Color{245, 236, 215, 255});
+
     if (IsKeyPressed(KEY_UP)) state.menuIndex = (state.menuIndex + 2) % 3;
     if (IsKeyPressed(KEY_DOWN)) state.menuIndex = (state.menuIndex + 1) % 3;
 
@@ -715,10 +1001,13 @@ void drawMainMenu(ClientState& state) {
 
     const bool activate = IsKeyPressed(KEY_ENTER);
     if (joinClicked || (activate && state.menuIndex == 0)) {
+        state.desiredJoinName = trimForJoinName(state.desiredJoinName);
         state.screenMode = ScreenMode::InGame;
         state.connected = false;
         state.localPlayerId = 0;
+        state.localPlayerName = state.desiredJoinName;
         state.players.clear();
+        state.latestServerTick = 0;
         DisableCursor();
     } else if (settingsClicked || (activate && state.menuIndex == 1)) {
         state.screenMode = ScreenMode::Settings;
@@ -726,7 +1015,7 @@ void drawMainMenu(ClientState& state) {
         CloseWindow();
     }
 
-    const char* hint = "Use Up/Down + Enter, or mouse";
+    const char* hint = "Type name, then join. Up/Down + Enter or mouse";
     const int hintSize = 24;
     const int hx = static_cast<int>(columnX + (columnW - MeasureText(hint, hintSize)) * 0.5f);
     const int hy = static_cast<int>(baseY + 292.0f);
@@ -830,6 +1119,7 @@ void sendInput(ClientState& state) {
     packet.dashMoveZ = state.dashMoveZ;
     packet.crouchHeld = (keyDown(KEY_LEFT_SHIFT) || keyDown(KEY_RIGHT_SHIFT)) ? 1 : 0;
     packet.weaponSlot = static_cast<uint8_t>(state.equippedWeapon);
+    packet.lastReceivedServerTick = state.latestServerTick;
     state.jumpQueued = false;
     state.fireQueued = false;
     state.dashQueued = false;
@@ -844,6 +1134,8 @@ void sendInput(ClientState& state) {
         reinterpret_cast<const sockaddr*>(&state.serverAddress),
         sizeof(state.serverAddress));
 }
+
+void cleanupMissingEnemyAnimState(ClientState& state);
 
 void pumpNetwork(ClientState& state) {
     char buffer[1500]{};
@@ -870,6 +1162,7 @@ void pumpNetwork(ClientState& state) {
             arena::WelcomePacket packet{};
             std::memcpy(&packet, buffer, sizeof(packet));
             state.localPlayerId = packet.playerId;
+            state.localPlayerName = std::string(packet.assignedName);
             state.connected = true;
         } else if (received == sizeof(arena::MapDataPacket) && arena::hasValidHeader(buffer, received, arena::PacketType::MapData)) {
             arena::MapDataPacket packet{};
@@ -885,12 +1178,14 @@ void pumpNetwork(ClientState& state) {
                    arena::hasValidHeader(buffer, received, arena::PacketType::Snapshot)) {
             arena::SnapshotPacket packet{};
             std::memcpy(&packet, buffer, std::min<int>(received, static_cast<int>(sizeof(packet))));
+            state.latestServerTick = packet.serverTick;
 
             std::map<uint32_t, RemotePlayer> nextPlayers;
             const uint32_t count = std::min<uint32_t>(packet.playerCount, arena::MaxPlayers);
             const double now = arena::secondsNow();
             for (uint32_t i = 0; i < count; ++i) {
                 RemotePlayer player{};
+                player.name = std::string(packet.players[i].name);
                 player.position = {packet.players[i].x, packet.players[i].y, packet.players[i].z};
                 player.yaw = packet.players[i].yaw;
                 player.pitch = packet.players[i].pitch;
@@ -905,6 +1200,10 @@ void pumpNetwork(ClientState& state) {
                 player.hitConfirmCount = packet.players[i].hitConfirmCount;
                 player.lastDamageDealt = packet.players[i].lastDamageDealt;
                 player.lastHitTargetId = packet.players[i].lastHitTargetId;
+                player.pingMs = packet.players[i].pingMs;
+                player.kills = packet.players[i].kills;
+                player.deaths = packet.players[i].deaths;
+                player.damageDealt = packet.players[i].damageDealt;
                 if (packet.players[i].playerId != state.localPlayerId && player.firing && state.audioReady) {
                     const uint8_t prevFiring = state.enemyPrevFiring[packet.players[i].playerId];
                     const bool risingEdge = prevFiring == 0;
@@ -943,6 +1242,7 @@ void pumpNetwork(ClientState& state) {
                     ++itS;
                 }
             }
+            cleanupMissingEnemyAnimState(state);
             state.team1TimeLeftSeconds = packet.team1TimeLeftSeconds;
             state.team2TimeLeftSeconds = packet.team2TimeLeftSeconds;
             state.hillOwnerTeam = packet.hillOwnerTeam;
@@ -1036,6 +1336,50 @@ void updateDamagePopups(ClientState& state, float dt) {
         state.damagePopups.end());
 }
 
+void drawTriangleBothSides(Vector3 a, Vector3 b, Vector3 c, Color color) {
+    DrawTriangle3D(a, b, c, color);
+    DrawTriangle3D(a, c, b, color);
+}
+
+void drawRampWedgeX(Vector3 center, float width, float depth, float height, Color fill, Color wire) {
+    const float halfW = width * 0.5f;
+    const float halfD = depth * 0.5f;
+
+    const Vector3 a{center.x - halfW, center.y, center.z - halfD}; // low-left-back
+    const Vector3 b{center.x + halfW, center.y, center.z - halfD}; // high-side base back
+    const Vector3 c{center.x + halfW, center.y, center.z + halfD}; // high-side base front
+    const Vector3 d{center.x - halfW, center.y, center.z + halfD}; // low-left-front
+    const Vector3 e{center.x + halfW, center.y + height, center.z - halfD}; // high-side top back
+    const Vector3 f{center.x + halfW, center.y + height, center.z + halfD}; // high-side top front
+
+    // Bottom.
+    drawTriangleBothSides(a, b, c, fill);
+    drawTriangleBothSides(a, c, d, fill);
+
+    // Sloped top.
+    drawTriangleBothSides(a, e, f, fill);
+    drawTriangleBothSides(a, f, d, fill);
+
+    // Side caps.
+    drawTriangleBothSides(a, b, e, fill);
+    drawTriangleBothSides(d, c, f, fill);
+
+    // Vertical high wall.
+    drawTriangleBothSides(b, c, f, fill);
+    drawTriangleBothSides(b, f, e, fill);
+
+    // Wire edges.
+    DrawLine3D(a, b, wire);
+    DrawLine3D(b, c, wire);
+    DrawLine3D(c, d, wire);
+    DrawLine3D(d, a, wire);
+    DrawLine3D(b, e, wire);
+    DrawLine3D(c, f, wire);
+    DrawLine3D(e, f, wire);
+    DrawLine3D(a, e, wire);
+    DrawLine3D(d, f, wire);
+}
+
 void drawKothTestMapGeometry(const ClientState& state) {
     const Color block{102, 108, 116, 255};
     const Color ramp{118, 104, 90, 255};
@@ -1060,8 +1404,13 @@ void drawKothTestMapGeometry(const ClientState& state) {
             }
             const float cx = state.mapOriginX + static_cast<float>(x) * state.mapCellSize;
             const float cz = state.mapOriginZ + static_cast<float>(z) * state.mapCellSize;
-            DrawCube({cx, h * 0.5f, cz}, state.mapCellSize * 0.95f, h, state.mapCellSize * 0.95f, c);
-            DrawCubeWires({cx, h * 0.5f, cz}, state.mapCellSize * 0.95f, h, state.mapCellSize * 0.95f, wire);
+            if (symbol == 'R') {
+                // Match server rampSurfaceYAt(): low at min-X, high at max-X.
+                drawRampWedgeX({cx, 0.0f, cz}, state.mapCellSize * 0.95f, state.mapCellSize * 0.95f, h, c, wire);
+            } else {
+                DrawCube({cx, h * 0.5f, cz}, state.mapCellSize * 0.95f, h, state.mapCellSize * 0.95f, c);
+                DrawCubeWires({cx, h * 0.5f, cz}, state.mapCellSize * 0.95f, h, state.mapCellSize * 0.95f, wire);
+            }
         }
     }
 }
@@ -1133,6 +1482,137 @@ void drawPlayerCapsule(const RemotePlayer& player) {
 
 }
 
+EnemyAnimClip pickEnemyAnim(const RemotePlayer& player, EnemyAnimState& animState, float dt) {
+    (void)player;
+    (void)animState;
+    (void)dt;
+    return EnemyAnimClip::Idle;
+
+    /*
+    const bool airborne = player.position.y > 0.08f;
+    if (player.dead) {
+        return EnemyAnimClip::HitReact;
+    }
+    if (airborne) {
+        return EnemyAnimClip::Jump; // Full jump clip used as airborne pose/sequence.
+    }
+    if (animState.wasAirborne && !airborne) {
+        animState.frame = 0.0f;
+    }
+    const float sinYaw = std::sin(player.yaw);
+    const float cosYaw = std::cos(player.yaw);
+    const arena::Vec3 forward{sinYaw, 0.0f, -cosYaw};
+    const arena::Vec3 right{cosYaw, 0.0f, sinYaw};
+    const arena::Vec3 velocity = animState.hasLastPosition && dt > 0.0001f
+        ? (player.position - animState.lastPosition) * (1.0f / dt)
+        : arena::Vec3{};
+    const float speed = std::sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+    animState.estimatedSpeed = speed;
+    if (speed < 0.45f) {
+        return EnemyAnimClip::Idle;
+    }
+    const float moveForward = arena::dot(velocity, forward);
+    const float moveRight = arena::dot(velocity, right);
+    if (std::abs(moveRight) > std::abs(moveForward) * 1.08f) {
+        return moveRight > 0.0f ? EnemyAnimClip::StrafeRight : EnemyAnimClip::StrafeLeft;
+    }
+    if (moveForward < -0.25f) {
+        return EnemyAnimClip::RunBackward;
+    }
+    if (speed > 4.6f) {
+        return EnemyAnimClip::RunForward;
+    }
+    return EnemyAnimClip::WalkForward;
+    */
+}
+
+void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const RemotePlayer& player, float dt) {
+    EnemyAnimState& animState = state.enemyAnimStateById[playerId];
+    EnemyClipAsset* renderClip = &state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
+    auto clipLooksDrawable = [](const EnemyClipAsset& c) {
+        if (!c.modelLoaded || c.model.meshCount <= 0 || c.model.meshes == nullptr) {
+            return false;
+        }
+        const BoundingBox b = getModelBounds(c.model);
+        const float sx = b.max.x - b.min.x;
+        const float sy = b.max.y - b.min.y;
+        const float sz = b.max.z - b.min.z;
+        return std::isfinite(sx) && std::isfinite(sy) && std::isfinite(sz) &&
+            sx > 0.00001f && sy > 0.00001f && sz > 0.00001f;
+    };
+    if (!clipLooksDrawable(*renderClip)) {
+        state.enemyModelDebug = "enemy model debug: idle model not loaded";
+        return;
+    }
+    constexpr bool kEnableRemoteEnemyAnimation = false;
+    if (kEnableRemoteEnemyAnimation && renderClip->anims != nullptr && renderClip->animCount > 0 && renderClip->animValidForModel) {
+        ModelAnimation& anim = renderClip->anims[0];
+        const float fps = firstAnimFpsOrDefault(renderClip->anims, renderClip->animCount);
+        animState.frame += fps * dt;
+        if (anim.frameCount > 0) {
+            while (animState.frame >= static_cast<float>(anim.frameCount)) {
+                animState.frame -= static_cast<float>(anim.frameCount);
+            }
+            const int frame = std::clamp(static_cast<int>(animState.frame), 0, anim.frameCount - 1);
+            UpdateModelAnimation(renderClip->model, anim, frame);
+        }
+    }
+
+    const BoundingBox dbgBounds = getModelBounds(renderClip->model);
+    const float dbgSizeX = dbgBounds.max.x - dbgBounds.min.x;
+    const float dbgSizeY = dbgBounds.max.y - dbgBounds.min.y;
+    const float dbgSizeZ = dbgBounds.max.z - dbgBounds.min.z;
+
+    const float scaleY = renderClip->modelScale * state.enemyTuneScale;
+    const float scaleXZ = scaleY;
+
+    // Model space yaw is mirrored relative to gameplay yaw for this rig/import path.
+    const float totalYawDeg = (-player.yaw * RAD2DEG) + state.enemyTuneRotY;
+    const Matrix yawOnly = MatrixRotateY(totalYawDeg * DEG2RAD);
+    const Vector3 localPivotOffset{
+        renderClip->modelCenterX * scaleXZ,
+        renderClip->modelMinY * scaleY,
+        renderClip->modelCenterZ * scaleXZ};
+    const Vector3 worldPivotOffset = Vector3Transform(localPivotOffset, yawOnly);
+    const Vector3 localTuneOffset{
+        state.enemyTuneOffsetX,
+        state.enemyTuneOffsetY,
+        state.enemyTuneOffsetZ};
+    const Vector3 worldTuneOffset = Vector3Transform(localTuneOffset, yawOnly);
+    Vector3 drawPos{
+        player.position.x - worldPivotOffset.x + worldTuneOffset.x,
+        player.position.y - worldPivotOffset.y + worldTuneOffset.y,
+        player.position.z - worldPivotOffset.z + worldTuneOffset.z
+    };
+    if (!std::isfinite(drawPos.x) || !std::isfinite(drawPos.y) || !std::isfinite(drawPos.z) || !std::isfinite(renderClip->modelScale)) {
+        state.enemyModelDebug = "enemy model debug: non-finite transform";
+        return;
+    }
+    state.enemyModelDebug = "enemy model debug: mesh=" + std::to_string(renderClip->model.meshCount) +
+        " vtx=" + std::to_string((renderClip->model.meshCount > 0) ? renderClip->model.meshes[0].vertexCount : 0) +
+        " tri=" + std::to_string((renderClip->model.meshCount > 0) ? renderClip->model.meshes[0].triangleCount : 0) +
+        " sx=" + std::to_string(dbgSizeX) +
+        " sy=" + std::to_string(dbgSizeY) +
+        " sz=" + std::to_string(dbgSizeZ) +
+        " sXZ=" + std::to_string(scaleXZ) +
+        " sY=" + std::to_string(scaleY) +
+        " minY=" + std::to_string(renderClip->modelMinY) +
+        " drawY=" + std::to_string(drawPos.y) +
+        " yaw=" + std::to_string(totalYawDeg) +
+        " frame=" + std::to_string(animState.frame) +
+        " anim=" + std::string(kEnableRemoteEnemyAnimation ? "on" : "off");
+    const Vector3 eulerDeg{
+        state.enemyTuneRotX,
+        totalYawDeg,
+        state.enemyTuneRotZ};
+    drawModelEuler(
+        renderClip->model,
+        drawPos,
+        eulerDeg,
+        Vector3{scaleXZ, scaleY, scaleXZ},
+        WHITE);
+}
+
 void drawRemoteWeaponProxy(const RemotePlayer& player) {
     if (player.dead) {
         return;
@@ -1192,6 +1672,52 @@ void drawRemoteServerLightningBeams(const ClientState& state) {
         DrawSphere(start, 0.08f, Color{170, 255, 248, 220});
         DrawSphere(end, 0.09f, Color{190, 255, 250, 200});
     }
+}
+
+void cleanupMissingEnemyAnimState(ClientState& state) {
+    for (auto it = state.enemyAnimStateById.begin(); it != state.enemyAnimStateById.end();) {
+        if (state.players.find(it->first) == state.players.end()) {
+            it = state.enemyAnimStateById.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void drawIdleEnemyModelPreview(ClientState& state, float dt) {
+    const size_t idleIndex = static_cast<size_t>(EnemyAnimClip::Idle);
+    EnemyClipAsset& idle = state.enemyClipAssets[idleIndex];
+    if (!idle.modelLoaded || idle.anims == nullptr || idle.animCount <= 0) {
+        return;
+    }
+
+    // Animate idle only when raylib validates this animation/model pair.
+    static float previewFrame = 0.0f;
+    if (idle.animValidForModel) {
+        ModelAnimation& anim = idle.anims[0];
+        const float fps = firstAnimFpsOrDefault(idle.anims, idle.animCount);
+        previewFrame += fps * dt;
+        if (anim.frameCount > 0) {
+            while (previewFrame >= static_cast<float>(anim.frameCount)) {
+                previewFrame -= static_cast<float>(anim.frameCount);
+            }
+            const int frame = std::clamp(static_cast<int>(previewFrame), 0, anim.frameCount - 1);
+            UpdateModelAnimation(idle.model, anim, frame);
+        }
+    }
+
+    const Vector3 drawPos{
+        0.0f,
+        0.0f - idle.modelMinY * idle.modelScale,
+        0.0f
+    };
+    DrawModelEx(
+        idle.model,
+        drawPos,
+        Vector3{0.0f, 1.0f, 0.0f},
+        180.0f,
+        Vector3{idle.modelScale, idle.modelScale, idle.modelScale},
+        WHITE);
 }
 
 void updateViewmodelAndFootsteps(ClientState& state, double now, float dt) {
@@ -1600,7 +2126,59 @@ void drawLightningBeamVfx(const ClientState& state, double now) {
     EndBlendMode();
 }
 
+void drawScoreboardOverlay(const ClientState& state) {
+    const int sw = GetScreenWidth();
+    const int sh = GetScreenHeight();
+    const int panelW = static_cast<int>(sw * 0.76f);
+    const int panelH = static_cast<int>(sh * 0.68f);
+    const int x = (sw - panelW) / 2;
+    const int y = static_cast<int>(sh * 0.12f);
+
+    DrawRectangle(x, y, panelW, panelH, Color{8, 12, 20, 220});
+    DrawRectangleLinesEx(Rectangle{static_cast<float>(x), static_cast<float>(y), static_cast<float>(panelW), static_cast<float>(panelH)}, 2.0f, Color{180, 194, 215, 230});
+    DrawText("Scoreboard", x + 18, y + 14, 34, Color{242, 234, 210, 255});
+
+    const int headerY = y + 62;
+    DrawText("Name", x + 26, headerY, 24, Color{224, 228, 236, 255});
+    DrawText("Ping", x + panelW - 360, headerY, 24, Color{224, 228, 236, 255});
+    DrawText("DMG", x + panelW - 270, headerY, 24, Color{224, 228, 236, 255});
+    DrawText("K", x + panelW - 180, headerY, 24, Color{224, 228, 236, 255});
+    DrawText("D", x + panelW - 130, headerY, 24, Color{224, 228, 236, 255});
+    DrawText("Tm", x + panelW - 82, headerY, 24, Color{224, 228, 236, 255});
+    DrawLine(x + 16, headerY + 30, x + panelW - 16, headerY + 30, Color{120, 136, 160, 255});
+
+    std::vector<std::pair<uint32_t, RemotePlayer>> rows;
+    rows.reserve(state.players.size());
+    for (const auto& entry : state.players) {
+        rows.push_back(entry);
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        if (a.second.teamId != b.second.teamId) return a.second.teamId < b.second.teamId;
+        if (a.second.kills != b.second.kills) return a.second.kills > b.second.kills;
+        return a.first < b.first;
+    });
+
+    int rowY = headerY + 42;
+    for (const auto& [id, p] : rows) {
+        const bool local = id == state.localPlayerId;
+        const Color rowColor = local ? Color{255, 230, 178, 255} : Color{218, 224, 232, 255};
+        const Color dimColor = local ? Color{255, 220, 155, 255} : Color{188, 196, 210, 255};
+        const std::string nm = p.name.empty() ? ("Player " + std::to_string(id)) : p.name;
+        DrawText(nm.c_str(), x + 26, rowY, 23, rowColor);
+        DrawText(TextFormat("%ums", p.pingMs), x + panelW - 360, rowY, 23, dimColor);
+        DrawText(TextFormat("%u", p.damageDealt), x + panelW - 270, rowY, 23, dimColor);
+        DrawText(TextFormat("%u", p.kills), x + panelW - 180, rowY, 23, dimColor);
+        DrawText(TextFormat("%u", p.deaths), x + panelW - 130, rowY, 23, dimColor);
+        DrawText(TextFormat("%u", p.teamId), x + panelW - 82, rowY, 23, dimColor);
+        rowY += 28;
+        if (rowY > y + panelH - 30) {
+            break;
+        }
+    }
+}
+
 void render(ClientState& state, double now) {
+    const float dt = std::max(GetFrameTime(), 0.0001f);
     const float localEyeHeight = state.localCrouched ? arena::CrouchEyeHeight : arena::StandEyeHeight;
     const Vector3 eye{state.smoothedRenderPosition.x, state.smoothedRenderPosition.y + localEyeHeight, state.smoothedRenderPosition.z};
     const Vector3 forward = cameraForward(state.yaw, state.pitch);
@@ -1617,12 +2195,18 @@ void render(ClientState& state, double now) {
 
     BeginMode3D(camera);
     drawRoom(state);
-
+    constexpr bool PreviewIdleModelOnly = false;
+    if (PreviewIdleModelOnly) {
+        drawIdleEnemyModelPreview(state, dt);
+    }
     for (const auto& [id, player] : state.players) {
         if (id == state.localPlayerId) {
             continue;
         }
-        drawPlayerCapsule(player);
+        if (PreviewIdleModelOnly) {
+            continue;
+        }
+        drawAnimatedRemotePlayer(state, id, player, dt);
         drawRemoteWeaponProxy(player);
     }
     drawRemoteServerLightningBeams(state);
@@ -1656,10 +2240,37 @@ void render(ClientState& state, double now) {
     const float displaySpeedUnits = state.currentSpeed * 100.0f;
     DrawText(TextFormat("%.0f u/s", displaySpeedUnits), cx + 14, cy + 14, 20, Color{225, 232, 245, 255});
 
+    uint32_t team1Points = 0;
+    uint32_t team2Points = 0;
+    for (const auto& [id, p] : state.players) {
+        (void)id;
+        if (p.teamId == 1) team1Points += p.kills;
+        if (p.teamId == 2) team2Points += p.kills;
+    }
     const std::string status = state.connected
-        ? "Connected as player " + std::to_string(state.localPlayerId) + " | players: " + std::to_string(state.players.size())
+        ? "Connected as " + state.localPlayerName + " (#" + std::to_string(state.localPlayerId) + ") | players: " + std::to_string(state.players.size())
         : "Connecting to server...";
-    DrawText(status.c_str(), 16, 16, 20, RAYWHITE);
+    DrawText(status.c_str(), 16, GetScreenHeight() - 58, 20, RAYWHITE);
+    if (!state.enemyAnimSetReady) {
+        DrawText(state.enemyAnimStatus.c_str(), 16, GetScreenHeight() - 82, 18, Color{255, 130, 130, 255});
+    }
+    DrawText(state.enemyModelDebug.c_str(), 16, GetScreenHeight() - 106, 18, Color{190, 225, 255, 255});
+    const std::string enemyTuneHud =
+        "enemy tune: scale=" + std::to_string(state.enemyTuneScale) +
+        " off(" + std::to_string(state.enemyTuneOffsetX) + "," + std::to_string(state.enemyTuneOffsetY) + "," + std::to_string(state.enemyTuneOffsetZ) + ")" +
+        " rot(" + std::to_string(state.enemyTuneRotX) + "," + std::to_string(state.enemyTuneRotY) + "," + std::to_string(state.enemyTuneRotZ) + ")";
+    DrawText(enemyTuneHud.c_str(), 16, GetScreenHeight() - 130, 18, Color{255, 210, 130, 255});
+    DrawText("I/O scale+/- | J/K x-/x+ | N/M y+/y- | L/P z-/z+ | 8/9/0 rot +90 | 7/U rotX-/+ | Y/H rotY-/+ | B/V rotZ-/+", 16, GetScreenHeight() - 154, 18, Color{255, 210, 130, 255});
+
+    const std::string t1Clock = formatClock(state.team1TimeLeftSeconds);
+    const std::string t2Clock = formatClock(state.team2TimeLeftSeconds);
+    const std::string topHud = "TEAM 1  " + t1Clock + "  PTS " + std::to_string(team1Points) +
+        "    |    TEAM 2  " + t2Clock + "  PTS " + std::to_string(team2Points);
+    const int topW = MeasureText(topHud.c_str(), 30);
+    const int topX = (GetScreenWidth() - topW) / 2;
+    DrawRectangle(topX - 18, 10, topW + 36, 42, Color{10, 15, 24, 205});
+    DrawRectangleLines(topX - 18, 10, topW + 36, 42, Color{190, 204, 224, 220});
+    DrawText(topHud.c_str(), topX, 18, 30, Color{255, 241, 206, 255});
     std::string weaponLabel = "Shotgun";
     if (state.equippedWeapon == WeaponSlot::Knife) weaponLabel = "Karambit";
     if (state.equippedWeapon == WeaponSlot::LightningGun) weaponLabel = "Lightning Gun";
@@ -1668,10 +2279,8 @@ void render(ClientState& state, double now) {
         : ((state.equippedWeapon == WeaponSlot::LightningGun) ? "LG beam active while holding fire" : "Karambit ready");
     DrawText(("Weapon: " + weaponLabel).c_str(), 16, 42, 20, RAYWHITE);
     DrawText(ammoText.c_str(), 16, 68, 20, RAYWHITE);
-    const std::string t1Clock = formatClock(state.team1TimeLeftSeconds);
-    const std::string t2Clock = formatClock(state.team2TimeLeftSeconds);
     const std::string teamText = "Team " + std::to_string(state.localTeamId == 0 ? 1 : state.localTeamId) +
-        " | HP: " + std::to_string(state.localHealth) + " | KOTH clock T1: " + t1Clock + "  T2: " + t2Clock;
+        " | HP: " + std::to_string(state.localHealth);
     DrawText(teamText.c_str(), 16, 94, 20, RAYWHITE);
     std::string hillText = "Hill: Neutral";
     if (state.hillWinnerTeam != 0) {
@@ -1691,7 +2300,10 @@ void render(ClientState& state, double now) {
     if (state.localDead) {
         DrawText("You are dead - respawning...", GetScreenWidth() / 2 - 190, GetScreenHeight() / 2 - 70, 30, RED);
     }
-    DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | A/D double-tap air dash | Shift crouch | 1 shotgun | 2 lightning gun | 3 knife | LMB attack/fire | F inspect | Esc menu", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
+    DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | A/D double-tap air dash | Shift crouch | 1 shotgun | 2 lightning gun | 3 knife | LMB attack/fire | F inspect | TAB scoreboard | Esc menu", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
+    if (keyDown(KEY_TAB)) {
+        drawScoreboardOverlay(state);
+    }
     DrawFPS(GetScreenWidth() - 95, 12);
 
     EndDrawing();
@@ -1792,6 +2404,58 @@ int main(int argc, char** argv) {
                     target = (state.equippedWeapon == WeaponSlot::Knife) ? WeaponSlot::Shotgun : WeaponSlot::Knife;
                 }
                 equipWeapon(state, target, arena::secondsNow());
+            }
+            if (IsKeyPressed(KEY_I)) {
+                state.enemyTuneScale = std::min(20.0f, state.enemyTuneScale + 0.05f);
+            }
+            if (IsKeyPressed(KEY_O)) {
+                state.enemyTuneScale = std::max(0.01f, state.enemyTuneScale - 0.05f);
+            }
+            if (IsKeyPressed(KEY_J)) {
+                state.enemyTuneOffsetX -= 0.05f;
+            }
+            if (IsKeyPressed(KEY_K)) {
+                state.enemyTuneOffsetX += 0.05f;
+            }
+            if (IsKeyPressed(KEY_N)) {
+                state.enemyTuneOffsetY += 0.05f;
+            }
+            if (IsKeyPressed(KEY_M)) {
+                state.enemyTuneOffsetY -= 0.05f;
+            }
+            if (IsKeyPressed(KEY_L)) {
+                state.enemyTuneOffsetZ -= 0.05f;
+            }
+            if (IsKeyPressed(KEY_P)) {
+                state.enemyTuneOffsetZ += 0.05f;
+            }
+            if (IsKeyPressed(KEY_EIGHT)) {
+                state.enemyTuneRotX = std::fmod(state.enemyTuneRotX + 90.0f, 360.0f);
+            }
+            if (IsKeyPressed(KEY_NINE)) {
+                state.enemyTuneRotY = std::fmod(state.enemyTuneRotY + 90.0f, 360.0f);
+            }
+            if (IsKeyPressed(KEY_ZERO)) {
+                state.enemyTuneRotZ = std::fmod(state.enemyTuneRotZ + 90.0f, 360.0f);
+            }
+            constexpr float FineRotStep = 2.0f;
+            if (IsKeyPressed(KEY_SEVEN)) {
+                state.enemyTuneRotX = std::fmod(state.enemyTuneRotX - FineRotStep + 360.0f, 360.0f);
+            }
+            if (IsKeyPressed(KEY_U)) {
+                state.enemyTuneRotX = std::fmod(state.enemyTuneRotX + FineRotStep, 360.0f);
+            }
+            if (IsKeyPressed(KEY_Y)) {
+                state.enemyTuneRotY = std::fmod(state.enemyTuneRotY - FineRotStep + 360.0f, 360.0f);
+            }
+            if (IsKeyPressed(KEY_H)) {
+                state.enemyTuneRotY = std::fmod(state.enemyTuneRotY + FineRotStep, 360.0f);
+            }
+            if (IsKeyPressed(KEY_B)) {
+                state.enemyTuneRotZ = std::fmod(state.enemyTuneRotZ - FineRotStep + 360.0f, 360.0f);
+            }
+            if (IsKeyPressed(KEY_V)) {
+                state.enemyTuneRotZ = std::fmod(state.enemyTuneRotZ + FineRotStep, 360.0f);
             }
             if (IsKeyPressed(KEY_ESCAPE)) {
                 state.screenMode = ScreenMode::MainMenu;
