@@ -4,6 +4,12 @@
 #include <raymath.h>
 #include <rlgl.h>
 
+#include <assimp/Importer.hpp>
+#include <assimp/config.h>
+#include <assimp/material.h>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -12,8 +18,11 @@
 #include <cstdio>
 #include <iostream>
 #include <initializer_list>
+#include <limits>
 #include <map>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -102,14 +111,19 @@ struct EnemyAnimState {
     arena::Vec3 lastPosition{};
     bool hasLastPosition = false;
     float estimatedSpeed = 0.0f;
+    float smoothedSpeed = 0.0f;
+    arena::Vec3 smoothedVelocity{};
     bool wasAirborne = false;
     EnemyAnimClip activeClip = EnemyAnimClip::Idle;
+    EnemyAnimClip pendingClip = EnemyAnimClip::Idle;
+    float pendingClipTime = 0.0f;
     float frame = 0.0f;
 };
 
 struct EnemyClipAsset {
     Model model{};
     bool modelLoaded = false;
+    std::string sourcePath{};
     float modelScale = 1.0f;
     float modelMinY = 0.0f;
     float modelCenterX = 0.0f;
@@ -117,7 +131,22 @@ struct EnemyClipAsset {
     ModelAnimation* anims = nullptr;
     int animCount = 0;
     bool animValidForModel = false;
+    float animFps = 30.0f;
+    std::vector<Texture2D> ownedTextures;
+    std::vector<unsigned char> alphaMeshes;
 };
+
+struct FbxModelLoadResult {
+    Model model{};
+    ModelAnimation* anims = nullptr;
+    int animCount = 0;
+    float animFps = 30.0f;
+    std::vector<Texture2D> ownedTextures;
+    std::vector<unsigned char> alphaMeshes;
+};
+
+void resetEnemyTune(class ClientState& state);
+void sanitizeEnemyTune(class ClientState& state);
 
 void forceVisibleMaterial(Model& model) {
     for (int i = 0; i < model.materialCount; ++i) {
@@ -131,7 +160,23 @@ void forceVisibleMaterial(Model& model) {
     }
 }
 
-void drawModelEuler(const Model& model, Vector3 position, Vector3 rotationDeg, Vector3 scale, Color tint) {
+void unloadEnemyClipAsset(EnemyClipAsset& clip) {
+    if (clip.anims != nullptr) {
+        UnloadModelAnimations(clip.anims, clip.animCount);
+    }
+    if (clip.modelLoaded) {
+        UnloadModel(clip.model);
+    }
+    for (Texture2D& texture : clip.ownedTextures) {
+        if (texture.id != 0) {
+            UnloadTexture(texture);
+        }
+    }
+    clip = EnemyClipAsset{};
+}
+
+void drawModelEuler(Model& model, Vector3 position, Vector3 rotationDeg, Vector3 scale, Color tint,
+    const std::vector<unsigned char>* alphaMeshes = nullptr) {
     rlPushMatrix();
     rlTranslatef(position.x, position.y, position.z);
     rlRotatef(rotationDeg.y, 0.0f, 1.0f, 0.0f);
@@ -139,7 +184,55 @@ void drawModelEuler(const Model& model, Vector3 position, Vector3 rotationDeg, V
     rlRotatef(rotationDeg.z, 0.0f, 0.0f, 1.0f);
     rlScalef(scale.x, scale.y, scale.z);
     // Use DrawModel on identity-local origin so raylib handles full model/material/shader path.
-    DrawModel(model, Vector3{0.0f, 0.0f, 0.0f}, 1.0f, tint);
+    rlDisableBackfaceCulling();
+    if (alphaMeshes == nullptr || alphaMeshes->empty()) {
+        DrawModel(model, Vector3{0.0f, 0.0f, 0.0f}, 1.0f, tint);
+    } else {
+        auto meshUsesAlphaPass = [&](int meshIndex) {
+            return meshIndex >= 0 && meshIndex < static_cast<int>(alphaMeshes->size()) &&
+                (*alphaMeshes)[static_cast<size_t>(meshIndex)] != 0;
+        };
+        auto drawMeshIndex = [&](int meshIndex) {
+            const int rawMaterialIndex = (model.meshMaterial != nullptr)
+                ? model.meshMaterial[meshIndex]
+                : 0;
+            const int materialIndex = std::clamp(rawMaterialIndex, 0, std::max(0, model.materialCount - 1));
+            Material& material = model.materials[materialIndex];
+            Color color = material.maps[MATERIAL_MAP_ALBEDO].color;
+            Color colorTint = WHITE;
+            colorTint.r = static_cast<unsigned char>((static_cast<int>(color.r) * static_cast<int>(tint.r)) / 255);
+            colorTint.g = static_cast<unsigned char>((static_cast<int>(color.g) * static_cast<int>(tint.g)) / 255);
+            colorTint.b = static_cast<unsigned char>((static_cast<int>(color.b) * static_cast<int>(tint.b)) / 255);
+            colorTint.a = static_cast<unsigned char>((static_cast<int>(color.a) * static_cast<int>(tint.a)) / 255);
+            material.maps[MATERIAL_MAP_ALBEDO].color = colorTint;
+            DrawMesh(model.meshes[meshIndex], material, model.transform);
+            material.maps[MATERIAL_MAP_ALBEDO].color = color;
+        };
+
+        bool hasAlphaMeshes = false;
+        for (int i = 0; i < model.meshCount; ++i) {
+            if (meshUsesAlphaPass(i)) {
+                hasAlphaMeshes = true;
+                continue;
+            }
+            drawMeshIndex(i);
+        }
+        if (hasAlphaMeshes) {
+            rlDrawRenderBatchActive();
+            rlSetBlendMode(RL_BLEND_ALPHA);
+            rlDisableDepthTest();
+            rlDisableDepthMask();
+            for (int i = 0; i < model.meshCount; ++i) {
+                if (meshUsesAlphaPass(i)) {
+                    drawMeshIndex(i);
+                }
+            }
+            rlDrawRenderBatchActive();
+            rlEnableDepthMask();
+            rlEnableDepthTest();
+        }
+    }
+    rlEnableBackfaceCulling();
     rlPopMatrix();
 }
 
@@ -318,6 +411,22 @@ struct ClientState {
     std::array<char, arena::MapMaxWidth * arena::MapMaxHeight> mapCells{};
 };
 
+void resetEnemyTune(ClientState& state) {
+    state.enemyTuneScale = 1.2f;
+    state.enemyTuneOffsetX = 0.0f;
+    state.enemyTuneOffsetY = -0.3f;
+    state.enemyTuneOffsetZ = 1.2f;
+    state.enemyTuneRotX = 270.0f;
+    state.enemyTuneRotY = 180.0f;
+    state.enemyTuneRotZ = 0.0f;
+}
+
+void sanitizeEnemyTune(ClientState& state) {
+    // Temporary hard lock while tracking an out-of-band overwrite of tune fields.
+    // Keeps FBX verification stable and prevents disappearing enemy models.
+    resetEnemyTune(state);
+}
+
 arena::Vec3 lerpVec3(arena::Vec3 a, arena::Vec3 b, float t) {
     return {
         a.x + (b.x - a.x) * t,
@@ -422,14 +531,6 @@ float firstAnimFpsOrDefault(const ModelAnimation* anim, int count) {
     return 30.0f;
 }
 
-bool loadEnemyAnimClip(const std::string& path, ModelAnimation*& outAnims, int& outCount) {
-    outAnims = nullptr;
-    outCount = 0;
-    const std::string resolved = resolveAssetPath(path);
-    outAnims = LoadModelAnimations(resolved.c_str(), &outCount);
-    return outAnims != nullptr && outCount > 0;
-}
-
 std::string resolveAssetPathIfExists(const std::string& relativePath) {
     static const std::array<const char*, 5> prefixes = {"", ".\\", "..\\", "..\\..\\", "..\\..\\..\\"};
     for (const char* prefix : prefixes) {
@@ -441,8 +542,780 @@ std::string resolveAssetPathIfExists(const std::string& relativePath) {
     return {};
 }
 
+std::string fileBaseName(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    return (slash == std::string::npos) ? path : path.substr(slash + 1);
+}
+
+std::string fileDirectory(const std::string& path) {
+    const size_t slash = path.find_last_of("\\/");
+    return (slash == std::string::npos) ? std::string{} : path.substr(0, slash);
+}
+
+std::string fileStem(const std::string& path) {
+    std::string base = fileBaseName(path);
+    const size_t dot = base.find_last_of('.');
+    if (dot != std::string::npos) {
+        base.resize(dot);
+    }
+    return base;
+}
+
+std::string joinAssetPath(const std::string& a, const std::string& b) {
+    if (a.empty()) return b;
+    if (b.empty()) return a;
+    const char back = a.back();
+    if (back == '\\' || back == '/') return a + b;
+    return a + "\\" + b;
+}
+
+std::string toLowerAscii(std::string value) {
+    for (char& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+bool containsNoCase(const std::string& haystack, const char* needle) {
+    return toLowerAscii(haystack).find(needle) != std::string::npos;
+}
+
+void copyFixedName(char* dst, size_t dstSize, const std::string& src) {
+    if (dst == nullptr || dstSize == 0) {
+        return;
+    }
+    std::memset(dst, 0, dstSize);
+    std::strncpy(dst, src.empty() ? "fbx" : src.c_str(), dstSize - 1);
+}
+
+Vector3 aiToVector3(const aiVector3D& v) {
+    return Vector3{v.x, v.y, v.z};
+}
+
+Quaternion aiToQuaternion(const aiQuaternion& q) {
+    return Quaternion{q.x, q.y, q.z, q.w};
+}
+
+Transform identityTransform() {
+    return Transform{
+        Vector3{0.0f, 0.0f, 0.0f},
+        Quaternion{0.0f, 0.0f, 0.0f, 1.0f},
+        Vector3{1.0f, 1.0f, 1.0f}
+    };
+}
+
+Transform aiMatrixToTransform(const aiMatrix4x4& matrix) {
+    aiVector3D scaling{};
+    aiQuaternion rotation{};
+    aiVector3D translation{};
+    matrix.Decompose(scaling, rotation, translation);
+    Transform transform{};
+    transform.translation = aiToVector3(translation);
+    transform.rotation = QuaternionNormalize(aiToQuaternion(rotation));
+    transform.scale = aiToVector3(scaling);
+    return transform;
+}
+
+Transform composeTransform(const Transform& parent, const Transform& local) {
+    Transform out{};
+    out.rotation = QuaternionMultiply(parent.rotation, local.rotation);
+    out.translation = Vector3RotateByQuaternion(local.translation, parent.rotation);
+    out.translation = Vector3Add(out.translation, parent.translation);
+    out.scale = Vector3Multiply(parent.scale, local.scale);
+    return out;
+}
+
+aiVector3D sampleVectorKeys(const aiVectorKey* keys, unsigned int count, double time, const aiVector3D& fallback) {
+    if (keys == nullptr || count == 0) {
+        return fallback;
+    }
+    if (count == 1 || time <= keys[0].mTime) {
+        return keys[0].mValue;
+    }
+    for (unsigned int i = 0; i + 1 < count; ++i) {
+        if (time <= keys[i + 1].mTime) {
+            const double span = keys[i + 1].mTime - keys[i].mTime;
+            const float t = (span > 0.000001) ? static_cast<float>((time - keys[i].mTime) / span) : 0.0f;
+            const aiVector3D& a = keys[i].mValue;
+            const aiVector3D& b = keys[i + 1].mValue;
+            return aiVector3D{
+                a.x + (b.x - a.x) * t,
+                a.y + (b.y - a.y) * t,
+                a.z + (b.z - a.z) * t
+            };
+        }
+    }
+    return keys[count - 1].mValue;
+}
+
+aiQuaternion sampleQuatKeys(const aiQuatKey* keys, unsigned int count, double time, const aiQuaternion& fallback) {
+    if (keys == nullptr || count == 0) {
+        return fallback;
+    }
+    if (count == 1 || time <= keys[0].mTime) {
+        return keys[0].mValue;
+    }
+    for (unsigned int i = 0; i + 1 < count; ++i) {
+        if (time <= keys[i + 1].mTime) {
+            const double span = keys[i + 1].mTime - keys[i].mTime;
+            const float t = (span > 0.000001) ? static_cast<float>((time - keys[i].mTime) / span) : 0.0f;
+            const Quaternion a = QuaternionNormalize(aiToQuaternion(keys[i].mValue));
+            const Quaternion b = QuaternionNormalize(aiToQuaternion(keys[i + 1].mValue));
+            const Quaternion q = QuaternionNormalize(QuaternionSlerp(a, b, t));
+            aiQuaternion out{};
+            out.x = q.x;
+            out.y = q.y;
+            out.z = q.z;
+            out.w = q.w;
+            return out;
+        }
+    }
+    return keys[count - 1].mValue;
+}
+
+struct VertexInfluence {
+    int boneIndex = 0;
+    float weight = 0.0f;
+};
+
+void addVertexInfluence(std::array<VertexInfluence, 4>& influences, int boneIndex, float weight) {
+    if (weight <= 0.0f || boneIndex < 0) {
+        return;
+    }
+    for (VertexInfluence& influence : influences) {
+        if (influence.weight > 0.0f && influence.boneIndex == boneIndex) {
+            influence.weight += weight;
+            return;
+        }
+    }
+    int slot = -1;
+    float smallest = std::numeric_limits<float>::max();
+    for (int i = 0; i < 4; ++i) {
+        if (influences[i].weight <= 0.0f) {
+            slot = i;
+            break;
+        }
+        if (influences[i].weight < smallest) {
+            smallest = influences[i].weight;
+            slot = i;
+        }
+    }
+    if (slot >= 0 && weight > influences[slot].weight) {
+        influences[slot] = VertexInfluence{boneIndex, weight};
+    }
+}
+
+void normalizeVertexInfluences(std::array<VertexInfluence, 4>& influences, int fallbackBone) {
+    float total = 0.0f;
+    for (const VertexInfluence& influence : influences) {
+        total += influence.weight;
+    }
+    if (total <= 0.000001f) {
+        influences = {};
+        influences[0] = VertexInfluence{std::max(0, fallbackBone), 1.0f};
+        return;
+    }
+    for (VertexInfluence& influence : influences) {
+        influence.weight /= total;
+    }
+}
+
+FbxModelLoadResult loadModelAssimpFbx(const std::string& path) {
+    FbxModelLoadResult result{};
+    Assimp::Importer importer;
+    importer.SetPropertyFloat(AI_CONFIG_GLOBAL_SCALE_FACTOR_KEY, 1.0f);
+    importer.SetPropertyInteger(AI_CONFIG_PP_LBW_MAX_WEIGHTS, 4);
+    importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_READ_MATERIALS, true);
+    importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_READ_TEXTURES, true);
+    importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_READ_ANIMATIONS, true);
+    importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_READ_WEIGHTS, true);
+
+    const aiScene* scene = importer.ReadFile(
+        path.c_str(),
+        aiProcess_Triangulate |
+            aiProcess_JoinIdenticalVertices |
+            aiProcess_GenSmoothNormals |
+            aiProcess_CalcTangentSpace |
+            aiProcess_ImproveCacheLocality |
+            aiProcess_LimitBoneWeights |
+            aiProcess_SortByPType |
+            aiProcess_GlobalScale
+    );
+
+    if (scene == nullptr || scene->mRootNode == nullptr || scene->mNumMeshes == 0 || scene->mMeshes == nullptr) {
+        throw std::runtime_error("Assimp failed to load FBX scene: " + path);
+    }
+
+    const std::string modelDir = fileDirectory(path);
+    const std::string modelStem = fileStem(path);
+    auto getExtWithDot = [](const std::string& p) {
+        const size_t dot = p.find_last_of('.');
+        return (dot == std::string::npos) ? std::string{} : p.substr(dot);
+    };
+
+    auto loadEmbeddedTexture = [&](const aiTexture* embedded, const std::string& requestedPath) -> Texture2D {
+        if (embedded == nullptr) {
+            return Texture2D{};
+        }
+        if (embedded->mHeight == 0) {
+            std::string ext = getExtWithDot(requestedPath);
+            if (ext.empty()) {
+                const std::string hint = embedded->achFormatHint;
+                ext = hint.empty() ? ".png" : "." + hint;
+            }
+            Image image = LoadImageFromMemory(
+                ext.c_str(),
+                reinterpret_cast<const unsigned char*>(embedded->pcData),
+                static_cast<int>(embedded->mWidth));
+            if (image.data == nullptr) {
+                return Texture2D{};
+            }
+            Texture2D tex = LoadTextureFromImage(image);
+            UnloadImage(image);
+            if (tex.id != 0) {
+                SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+                SetTextureWrap(tex, TEXTURE_WRAP_CLAMP);
+            }
+            return tex;
+        }
+
+        const int width = static_cast<int>(embedded->mWidth);
+        const int height = static_cast<int>(embedded->mHeight);
+        if (width <= 0 || height <= 0) {
+            return Texture2D{};
+        }
+        const size_t byteCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+        void* pixels = MemAlloc(byteCount);
+        if (pixels == nullptr) {
+            return Texture2D{};
+        }
+        std::memcpy(pixels, embedded->pcData, byteCount);
+        Image image{};
+        image.data = pixels;
+        image.width = width;
+        image.height = height;
+        image.mipmaps = 1;
+        image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        Texture2D tex = LoadTextureFromImage(image);
+        UnloadImage(image);
+        if (tex.id != 0) {
+            SetTextureFilter(tex, TEXTURE_FILTER_BILINEAR);
+            SetTextureWrap(tex, TEXTURE_WRAP_CLAMP);
+        }
+        return tex;
+    };
+
+    auto findEmbeddedTexture = [&](const std::string& texPath) -> const aiTexture* {
+        if (scene->mTextures == nullptr || scene->mNumTextures == 0) {
+            return nullptr;
+        }
+        if (!texPath.empty() && texPath[0] == '*') {
+            const int embeddedIndex = std::atoi(texPath.c_str() + 1);
+            if (embeddedIndex >= 0 && static_cast<unsigned int>(embeddedIndex) < scene->mNumTextures) {
+                return scene->mTextures[embeddedIndex];
+            }
+        }
+        const std::string wantedBase = fileBaseName(texPath);
+        for (unsigned int i = 0; i < scene->mNumTextures; ++i) {
+            const aiTexture* embedded = scene->mTextures[i];
+            if (embedded == nullptr) {
+                continue;
+            }
+            const std::string embeddedName = embedded->mFilename.C_Str();
+            if (!embeddedName.empty() && (embeddedName == texPath || fileBaseName(embeddedName) == wantedBase)) {
+                return embedded;
+            }
+        }
+        return nullptr;
+    };
+
+    result.model.materialCount = std::max(1, static_cast<int>(scene->mNumMaterials));
+    result.model.materials = static_cast<Material*>(MemAlloc(static_cast<size_t>(result.model.materialCount) * sizeof(Material)));
+    if (result.model.materials == nullptr) {
+        throw std::runtime_error("Out of memory while allocating FBX materials: " + path);
+    }
+    for (int i = 0; i < result.model.materialCount; ++i) {
+        result.model.materials[i] = LoadMaterialDefault();
+        result.model.materials[i].maps[MATERIAL_MAP_ALBEDO].color = Color{255, 120, 120, 255};
+    }
+
+    auto assignTextureByPath = [&](const std::string& texPath, Material& outMaterial) {
+        if (texPath.empty()) {
+            return false;
+        }
+        if (const aiTexture* embedded = findEmbeddedTexture(texPath)) {
+            Texture2D texture = loadEmbeddedTexture(embedded, texPath);
+            if (texture.id != 0) {
+                result.ownedTextures.push_back(texture);
+                outMaterial.maps[MATERIAL_MAP_ALBEDO].texture = texture;
+                outMaterial.maps[MATERIAL_MAP_ALBEDO].color = WHITE;
+                return true;
+            }
+        }
+
+        const std::string base = fileBaseName(texPath);
+        const std::string fbmDir = joinAssetPath(modelDir, modelStem + ".fbm");
+        const std::array<std::string, 5> candidates = {
+            joinAssetPath(modelDir, texPath),
+            joinAssetPath(modelDir, base),
+            joinAssetPath(fbmDir, base),
+            joinAssetPath("assets\\Walk Forward.fbm", base),
+            joinAssetPath("assets", base)
+        };
+        for (const std::string& candidate : candidates) {
+            if (candidate.empty() || !FileExists(candidate.c_str())) {
+                continue;
+            }
+            Texture2D texture = LoadTexture(candidate.c_str());
+            if (texture.id == 0) {
+                continue;
+            }
+            SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
+            SetTextureWrap(texture, TEXTURE_WRAP_CLAMP);
+            result.ownedTextures.push_back(texture);
+            outMaterial.maps[MATERIAL_MAP_ALBEDO].texture = texture;
+            outMaterial.maps[MATERIAL_MAP_ALBEDO].color = WHITE;
+            return true;
+        }
+        return false;
+    };
+
+    auto fallbackTextureNameFor = [](const std::string& rawName) -> const char* {
+        if (containsNoCase(rawName, "hair")) return "hair_DM.png";
+        if (containsNoCase(rawName, "eye")) return "AliceW_Eye_DM.png";
+        if (containsNoCase(rawName, "skin") || containsNoCase(rawName, "body") ||
+            containsNoCase(rawName, "head") || containsNoCase(rawName, "arm") ||
+            containsNoCase(rawName, "hand")) {
+            return "AliceW_Skin_DM.png";
+        }
+        if (containsNoCase(rawName, "skirt") || containsNoCase(rawName, "apron")) return "AliceW_Skirt_DM.png";
+        if (containsNoCase(rawName, "cloth") || containsNoCase(rawName, "sleeve") ||
+            containsNoCase(rawName, "ribbon") || containsNoCase(rawName, "bow")) {
+            return "AliceW_Cloth_DM.png";
+        }
+        return nullptr;
+    };
+
+    auto assignFallbackTextureByName = [&](const std::string& rawName, Material& outMaterial) {
+        if (outMaterial.maps[MATERIAL_MAP_ALBEDO].texture.id != 0) {
+            return true;
+        }
+        const char* fallbackTexture = fallbackTextureNameFor(rawName);
+        return fallbackTexture != nullptr && assignTextureByPath(fallbackTexture, outMaterial);
+    };
+
+    auto loadTextureFromMaterial = [&](const aiMaterial* material, aiTextureType type, Material& outMaterial) {
+        if (material == nullptr || material->GetTextureCount(type) == 0) {
+            return false;
+        }
+        for (unsigned int i = 0; i < material->GetTextureCount(type); ++i) {
+            aiString texRef{};
+            if (material->GetTexture(type, i, &texRef) != AI_SUCCESS) {
+                continue;
+            }
+            if (assignTextureByPath(texRef.C_Str(), outMaterial)) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
+        Material& outMaterial = result.model.materials[i];
+        const aiMaterial* material = scene->mMaterials[i];
+        aiString materialName{};
+        if (material != nullptr) {
+            material->Get(AI_MATKEY_NAME, materialName);
+        }
+        aiColor4D diffuse{};
+        if (material != nullptr && aiGetMaterialColor(material, AI_MATKEY_COLOR_DIFFUSE, &diffuse) == AI_SUCCESS) {
+            outMaterial.maps[MATERIAL_MAP_ALBEDO].color = Color{
+                static_cast<unsigned char>(std::clamp(diffuse.r, 0.0f, 1.0f) * 255.0f),
+                static_cast<unsigned char>(std::clamp(diffuse.g, 0.0f, 1.0f) * 255.0f),
+                static_cast<unsigned char>(std::clamp(diffuse.b, 0.0f, 1.0f) * 255.0f),
+                static_cast<unsigned char>(std::clamp(diffuse.a, 0.0f, 1.0f) * 255.0f)
+            };
+        }
+        const std::array<aiTextureType, 5> textureTypes = {
+            aiTextureType_BASE_COLOR,
+            aiTextureType_DIFFUSE,
+            aiTextureType_UNKNOWN,
+            aiTextureType_AMBIENT,
+            aiTextureType_EMISSIVE
+        };
+        bool loadedTexture = false;
+        for (aiTextureType type : textureTypes) {
+            if (loadTextureFromMaterial(material, type, outMaterial)) {
+                loadedTexture = true;
+                break;
+            }
+        }
+        if (!loadedTexture) {
+            assignFallbackTextureByName(materialName.C_Str(), outMaterial);
+        }
+    }
+
+    std::vector<aiMatrix4x4> meshTransforms(scene->mNumMeshes);
+    std::vector<bool> meshTransformSet(scene->mNumMeshes, false);
+    std::map<std::string, const aiNode*> nodeByName;
+    aiMatrix4x4 identity;
+    auto walkNode = [&](const aiNode* root, auto&& self, const aiMatrix4x4& parent) -> void {
+        if (root == nullptr) {
+            return;
+        }
+        const aiMatrix4x4 world = parent * root->mTransformation;
+        nodeByName[root->mName.C_Str()] = root;
+        for (unsigned int i = 0; i < root->mNumMeshes; ++i) {
+            const unsigned int meshIndex = root->mMeshes[i];
+            if (meshIndex < meshTransforms.size()) {
+                meshTransforms[meshIndex] = world;
+                meshTransformSet[meshIndex] = true;
+            }
+        }
+        for (unsigned int i = 0; i < root->mNumChildren; ++i) {
+            self(root->mChildren[i], self, world);
+        }
+    };
+    walkNode(scene->mRootNode, walkNode, identity);
+
+    std::map<std::string, bool> weightedBoneNames;
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        const aiMesh* mesh = scene->mMeshes[m];
+        if (mesh == nullptr) {
+            continue;
+        }
+        for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+            const aiBone* bone = mesh->mBones[b];
+            if (bone != nullptr) {
+                weightedBoneNames[bone->mName.C_Str()] = true;
+            }
+        }
+    }
+
+    std::map<std::string, bool> requiredNodeNames;
+    for (const auto& [boneName, ignored] : weightedBoneNames) {
+        (void)ignored;
+        auto found = nodeByName.find(boneName);
+        if (found == nodeByName.end()) {
+            continue;
+        }
+        const aiNode* node = found->second;
+        while (node != nullptr) {
+            requiredNodeNames[node->mName.C_Str()] = true;
+            node = node->mParent;
+        }
+    }
+
+    std::vector<const aiNode*> boneNodes;
+    std::map<std::string, int> boneIndexByName;
+    auto collectBoneNodes = [&](const aiNode* root, auto&& self) -> void {
+        if (root == nullptr) {
+            return;
+        }
+        const std::string name = root->mName.C_Str();
+        if (requiredNodeNames.find(name) != requiredNodeNames.end()) {
+            const int index = static_cast<int>(boneNodes.size());
+            boneNodes.push_back(root);
+            boneIndexByName[name] = index;
+        }
+        for (unsigned int i = 0; i < root->mNumChildren; ++i) {
+            self(root->mChildren[i], self);
+        }
+    };
+    collectBoneNodes(scene->mRootNode, collectBoneNodes);
+
+    const int realBoneCount = static_cast<int>(boneNodes.size());
+    const int noBoneIndex = (realBoneCount > 0) ? realBoneCount : -1;
+    if (realBoneCount + ((noBoneIndex >= 0) ? 1 : 0) > 255) {
+        throw std::runtime_error("FBX skeleton has more than 255 bones, raylib skinning cannot address it: " + path);
+    }
+    if (realBoneCount > 0) {
+        result.model.boneCount = realBoneCount + 1;
+        result.model.bones = static_cast<BoneInfo*>(MemAlloc(static_cast<size_t>(result.model.boneCount) * sizeof(BoneInfo)));
+        result.model.bindPose = static_cast<Transform*>(MemAlloc(static_cast<size_t>(result.model.boneCount) * sizeof(Transform)));
+        if (result.model.bones == nullptr || result.model.bindPose == nullptr) {
+            throw std::runtime_error("Out of memory while allocating FBX bones: " + path);
+        }
+        std::vector<Transform> localBind(result.model.boneCount, identityTransform());
+        for (int i = 0; i < realBoneCount; ++i) {
+            const aiNode* node = boneNodes[static_cast<size_t>(i)];
+            copyFixedName(result.model.bones[i].name, sizeof(result.model.bones[i].name), node->mName.C_Str());
+            int parentIndex = -1;
+            const aiNode* parent = node->mParent;
+            while (parent != nullptr) {
+                auto parentFound = boneIndexByName.find(parent->mName.C_Str());
+                if (parentFound != boneIndexByName.end()) {
+                    parentIndex = parentFound->second;
+                    break;
+                }
+                parent = parent->mParent;
+            }
+            result.model.bones[i].parent = parentIndex;
+            localBind[i] = aiMatrixToTransform(node->mTransformation);
+        }
+        copyFixedName(result.model.bones[noBoneIndex].name, sizeof(result.model.bones[noBoneIndex].name), "NO_BONE");
+        result.model.bones[noBoneIndex].parent = -1;
+        localBind[noBoneIndex] = identityTransform();
+        for (int i = 0; i < result.model.boneCount; ++i) {
+            const int parent = result.model.bones[i].parent;
+            result.model.bindPose[i] = (parent >= 0) ? composeTransform(result.model.bindPose[parent], localBind[i]) : localBind[i];
+        }
+    }
+
+    struct SourceMesh {
+        const aiMesh* mesh = nullptr;
+        aiMatrix4x4 world{};
+        size_t triVerts = 0;
+    };
+
+    std::vector<SourceMesh> sourceMeshes;
+    for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+        const aiMesh* mesh = scene->mMeshes[m];
+        if (mesh == nullptr) {
+            continue;
+        }
+        size_t triVerts = 0;
+        for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+            if (mesh->mFaces[f].mNumIndices == 3) {
+                triVerts += 3;
+            }
+        }
+        if (triVerts > 0) {
+            sourceMeshes.push_back(SourceMesh{mesh, meshTransformSet[m] ? meshTransforms[m] : identity, triVerts});
+        }
+    }
+    if (sourceMeshes.empty()) {
+        throw std::runtime_error("Assimp FBX has no triangulated faces: " + path);
+    }
+
+    result.model.meshCount = static_cast<int>(sourceMeshes.size());
+    result.model.meshes = static_cast<Mesh*>(MemAlloc(static_cast<size_t>(result.model.meshCount) * sizeof(Mesh)));
+    result.model.meshMaterial = static_cast<int*>(MemAlloc(static_cast<size_t>(result.model.meshCount) * sizeof(int)));
+    result.alphaMeshes.assign(static_cast<size_t>(result.model.meshCount), 0);
+    if (result.model.meshes == nullptr || result.model.meshMaterial == nullptr) {
+        throw std::runtime_error("Out of memory while allocating FBX meshes: " + path);
+    }
+    std::memset(result.model.meshes, 0, static_cast<size_t>(result.model.meshCount) * sizeof(Mesh));
+    std::memset(result.model.meshMaterial, 0, static_cast<size_t>(result.model.meshCount) * sizeof(int));
+
+    for (int meshIndex = 0; meshIndex < result.model.meshCount; ++meshIndex) {
+        const SourceMesh& source = sourceMeshes[static_cast<size_t>(meshIndex)];
+        const aiMesh* mesh = source.mesh;
+        Mesh& outMesh = result.model.meshes[meshIndex];
+        outMesh.vertexCount = static_cast<int>(source.triVerts);
+        outMesh.triangleCount = outMesh.vertexCount / 3;
+        outMesh.vertices = static_cast<float*>(MemAlloc(static_cast<size_t>(outMesh.vertexCount) * 3 * sizeof(float)));
+        outMesh.normals = static_cast<float*>(MemAlloc(static_cast<size_t>(outMesh.vertexCount) * 3 * sizeof(float)));
+        outMesh.texcoords = static_cast<float*>(MemAlloc(static_cast<size_t>(outMesh.vertexCount) * 2 * sizeof(float)));
+        if (outMesh.vertices == nullptr || outMesh.normals == nullptr || outMesh.texcoords == nullptr) {
+            throw std::runtime_error("Out of memory while converting FBX mesh: " + path);
+        }
+        if (result.model.boneCount > 0) {
+            outMesh.boneIds = static_cast<unsigned char*>(MemAlloc(static_cast<size_t>(outMesh.vertexCount) * 4 * sizeof(unsigned char)));
+            outMesh.boneWeights = static_cast<float*>(MemAlloc(static_cast<size_t>(outMesh.vertexCount) * 4 * sizeof(float)));
+            outMesh.animVertices = static_cast<float*>(MemAlloc(static_cast<size_t>(outMesh.vertexCount) * 3 * sizeof(float)));
+            outMesh.animNormals = static_cast<float*>(MemAlloc(static_cast<size_t>(outMesh.vertexCount) * 3 * sizeof(float)));
+            outMesh.boneMatrices = static_cast<Matrix*>(MemAlloc(static_cast<size_t>(result.model.boneCount) * sizeof(Matrix)));
+            if (outMesh.boneIds == nullptr || outMesh.boneWeights == nullptr ||
+                outMesh.animVertices == nullptr || outMesh.animNormals == nullptr || outMesh.boneMatrices == nullptr) {
+                throw std::runtime_error("Out of memory while allocating FBX skin data: " + path);
+            }
+            std::memset(outMesh.boneIds, 0, static_cast<size_t>(outMesh.vertexCount) * 4 * sizeof(unsigned char));
+            std::memset(outMesh.boneWeights, 0, static_cast<size_t>(outMesh.vertexCount) * 4 * sizeof(float));
+            outMesh.boneCount = result.model.boneCount;
+            for (int b = 0; b < result.model.boneCount; ++b) {
+                outMesh.boneMatrices[b] = MatrixIdentity();
+            }
+        }
+
+        result.model.meshMaterial[meshIndex] = (mesh->mMaterialIndex < static_cast<unsigned int>(result.model.materialCount))
+            ? static_cast<int>(mesh->mMaterialIndex)
+            : 0;
+        Material& meshMaterial = result.model.materials[result.model.meshMaterial[meshIndex]];
+        assignFallbackTextureByName(mesh->mName.C_Str(), meshMaterial);
+        aiString meshMaterialName{};
+        if (mesh->mMaterialIndex < scene->mNumMaterials && scene->mMaterials[mesh->mMaterialIndex] != nullptr) {
+            scene->mMaterials[mesh->mMaterialIndex]->Get(AI_MATKEY_NAME, meshMaterialName);
+        }
+        result.alphaMeshes[static_cast<size_t>(meshIndex)] =
+            (containsNoCase(mesh->mName.C_Str(), "hair") ||
+             containsNoCase(meshMaterialName.C_Str(), "hair")) ? 1 : 0;
+
+        std::vector<std::array<VertexInfluence, 4>> sourceInfluences(mesh->mNumVertices);
+        if (result.model.boneCount > 0) {
+            for (unsigned int b = 0; b < mesh->mNumBones; ++b) {
+                const aiBone* bone = mesh->mBones[b];
+                if (bone == nullptr) {
+                    continue;
+                }
+                auto found = boneIndexByName.find(bone->mName.C_Str());
+                const int boneIndex = (found != boneIndexByName.end()) ? found->second : noBoneIndex;
+                for (unsigned int w = 0; w < bone->mNumWeights; ++w) {
+                    const aiVertexWeight& weight = bone->mWeights[w];
+                    if (weight.mVertexId < sourceInfluences.size()) {
+                        addVertexInfluence(sourceInfluences[weight.mVertexId], boneIndex, weight.mWeight);
+                    }
+                }
+            }
+            for (std::array<VertexInfluence, 4>& influences : sourceInfluences) {
+                normalizeVertexInfluences(influences, noBoneIndex);
+            }
+        }
+
+        aiMatrix3x3 normalMatrix(source.world);
+        normalMatrix.Inverse().Transpose();
+        int outVertex = 0;
+        for (unsigned int f = 0; f < mesh->mNumFaces; ++f) {
+            const aiFace& face = mesh->mFaces[f];
+            if (face.mNumIndices != 3) {
+                continue;
+            }
+            for (unsigned int i = 0; i < 3; ++i) {
+                const unsigned int idx = face.mIndices[i];
+                const aiVector3D wp = source.world * mesh->mVertices[idx];
+                outMesh.vertices[outVertex * 3 + 0] = wp.x;
+                outMesh.vertices[outVertex * 3 + 1] = wp.y;
+                outMesh.vertices[outVertex * 3 + 2] = wp.z;
+
+                aiVector3D wn{0.0f, 1.0f, 0.0f};
+                if (mesh->HasNormals()) {
+                    wn = normalMatrix * mesh->mNormals[idx];
+                    if (wn.SquareLength() > 0.000001f) {
+                        wn.Normalize();
+                    }
+                }
+                outMesh.normals[outVertex * 3 + 0] = wn.x;
+                outMesh.normals[outVertex * 3 + 1] = wn.y;
+                outMesh.normals[outVertex * 3 + 2] = wn.z;
+
+                if (mesh->HasTextureCoords(0)) {
+                    const aiVector3D& uv = mesh->mTextureCoords[0][idx];
+                    outMesh.texcoords[outVertex * 2 + 0] = uv.x;
+                    outMesh.texcoords[outVertex * 2 + 1] = 1.0f - uv.y;
+                } else {
+                    outMesh.texcoords[outVertex * 2 + 0] = 0.0f;
+                    outMesh.texcoords[outVertex * 2 + 1] = 0.0f;
+                }
+
+                if (result.model.boneCount > 0) {
+                    const std::array<VertexInfluence, 4>& influences = sourceInfluences[idx];
+                    for (int b = 0; b < 4; ++b) {
+                        outMesh.boneIds[outVertex * 4 + b] = static_cast<unsigned char>(influences[b].boneIndex);
+                        outMesh.boneWeights[outVertex * 4 + b] = influences[b].weight;
+                    }
+                }
+                outVertex++;
+            }
+        }
+
+        if (result.model.boneCount > 0) {
+            std::memcpy(outMesh.animVertices, outMesh.vertices, static_cast<size_t>(outMesh.vertexCount) * 3 * sizeof(float));
+            std::memcpy(outMesh.animNormals, outMesh.normals, static_cast<size_t>(outMesh.vertexCount) * 3 * sizeof(float));
+        }
+        UploadMesh(&outMesh, result.model.boneCount > 0);
+    }
+
+    result.model.transform = MatrixIdentity();
+
+    if (result.model.boneCount > 0 && scene->mNumAnimations > 0) {
+        result.animCount = static_cast<int>(scene->mNumAnimations);
+        result.anims = static_cast<ModelAnimation*>(MemAlloc(static_cast<size_t>(result.animCount) * sizeof(ModelAnimation)));
+        if (result.anims == nullptr) {
+            throw std::runtime_error("Out of memory while allocating FBX animations: " + path);
+        }
+        std::memset(result.anims, 0, static_cast<size_t>(result.animCount) * sizeof(ModelAnimation));
+
+        std::vector<Transform> localBind(result.model.boneCount, identityTransform());
+        for (int i = 0; i < realBoneCount; ++i) {
+            localBind[i] = aiMatrixToTransform(boneNodes[static_cast<size_t>(i)]->mTransformation);
+        }
+
+        for (int a = 0; a < result.animCount; ++a) {
+            const aiAnimation* sourceAnim = scene->mAnimations[a];
+            ModelAnimation& anim = result.anims[a];
+            anim.boneCount = result.model.boneCount;
+            anim.bones = static_cast<BoneInfo*>(MemAlloc(static_cast<size_t>(anim.boneCount) * sizeof(BoneInfo)));
+            if (anim.bones == nullptr) {
+                throw std::runtime_error("Out of memory while copying FBX animation bones: " + path);
+            }
+            std::memcpy(anim.bones, result.model.bones, static_cast<size_t>(anim.boneCount) * sizeof(BoneInfo));
+            copyFixedName(anim.name, sizeof(anim.name), (sourceAnim != nullptr) ? sourceAnim->mName.C_Str() : modelStem);
+
+            std::map<std::string, const aiNodeAnim*> channelsByName;
+            double maxKeyTime = 0.0;
+            if (sourceAnim != nullptr) {
+                for (unsigned int c = 0; c < sourceAnim->mNumChannels; ++c) {
+                    const aiNodeAnim* channel = sourceAnim->mChannels[c];
+                    if (channel == nullptr) {
+                        continue;
+                    }
+                    channelsByName[channel->mNodeName.C_Str()] = channel;
+                    if (channel->mNumPositionKeys > 0) maxKeyTime = std::max(maxKeyTime, channel->mPositionKeys[channel->mNumPositionKeys - 1].mTime);
+                    if (channel->mNumRotationKeys > 0) maxKeyTime = std::max(maxKeyTime, channel->mRotationKeys[channel->mNumRotationKeys - 1].mTime);
+                    if (channel->mNumScalingKeys > 0) maxKeyTime = std::max(maxKeyTime, channel->mScalingKeys[channel->mNumScalingKeys - 1].mTime);
+                }
+            }
+
+            const double ticksPerSecond = (sourceAnim != nullptr && sourceAnim->mTicksPerSecond > 0.0) ? sourceAnim->mTicksPerSecond : 30.0;
+            const double durationTicks = std::max((sourceAnim != nullptr) ? sourceAnim->mDuration : 0.0, maxKeyTime);
+            const double durationSeconds = (durationTicks > 0.0) ? (durationTicks / ticksPerSecond) : (1.0 / result.animFps);
+            anim.frameCount = std::max(2, static_cast<int>(std::floor(durationSeconds * result.animFps + 0.5)) + 1);
+            anim.framePoses = static_cast<Transform**>(MemAlloc(static_cast<size_t>(anim.frameCount) * sizeof(Transform*)));
+            if (anim.framePoses == nullptr) {
+                throw std::runtime_error("Out of memory while allocating FBX animation poses: " + path);
+            }
+
+            for (int frame = 0; frame < anim.frameCount; ++frame) {
+                anim.framePoses[frame] = static_cast<Transform*>(MemAlloc(static_cast<size_t>(anim.boneCount) * sizeof(Transform)));
+                if (anim.framePoses[frame] == nullptr) {
+                    throw std::runtime_error("Out of memory while allocating FBX animation frame: " + path);
+                }
+                const double time = (durationTicks > 0.0)
+                    ? std::min(durationTicks, (static_cast<double>(frame) / result.animFps) * ticksPerSecond)
+                    : 0.0;
+                std::vector<Transform> localPose = localBind;
+
+                for (int b = 0; b < realBoneCount; ++b) {
+                    const aiNode* node = boneNodes[static_cast<size_t>(b)];
+                    auto channelFound = channelsByName.find(node->mName.C_Str());
+                    if (channelFound == channelsByName.end()) {
+                        continue;
+                    }
+                    const aiNodeAnim* channel = channelFound->second;
+                    aiVector3D defaultScale{localBind[b].scale.x, localBind[b].scale.y, localBind[b].scale.z};
+                    aiQuaternion defaultRot{};
+                    defaultRot.x = localBind[b].rotation.x;
+                    defaultRot.y = localBind[b].rotation.y;
+                    defaultRot.z = localBind[b].rotation.z;
+                    defaultRot.w = localBind[b].rotation.w;
+                    aiVector3D defaultPos{localBind[b].translation.x, localBind[b].translation.y, localBind[b].translation.z};
+
+                    const aiVector3D pos = sampleVectorKeys(channel->mPositionKeys, channel->mNumPositionKeys, time, defaultPos);
+                    const aiQuaternion rot = sampleQuatKeys(channel->mRotationKeys, channel->mNumRotationKeys, time, defaultRot);
+                    const aiVector3D scale = sampleVectorKeys(channel->mScalingKeys, channel->mNumScalingKeys, time, defaultScale);
+                    localPose[b].translation = aiToVector3(pos);
+                    localPose[b].rotation = QuaternionNormalize(aiToQuaternion(rot));
+                    localPose[b].scale = aiToVector3(scale);
+                }
+
+                if (noBoneIndex >= 0) {
+                    localPose[noBoneIndex] = identityTransform();
+                }
+                for (int b = 0; b < anim.boneCount; ++b) {
+                    const int parent = anim.bones[b].parent;
+                    anim.framePoses[frame][b] = (parent >= 0)
+                        ? composeTransform(anim.framePoses[frame][parent], localPose[b])
+                        : localPose[b];
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
 std::string resolvePreferredAnimAsset(const char* stemNoExt) {
-    const std::array<const char*, 4> extensions = {".glb", ".gltf", ".iqm", ".fbx"};
+    const std::array<const char*, 1> extensions = {".fbx"};
     for (const char* ext : extensions) {
         const std::string rel = std::string("assets\\") + stemNoExt + ext;
         const std::string found = resolveAssetPathIfExists(rel);
@@ -457,15 +1330,7 @@ void initEnemyModelAssets(ClientState& state) {
     state.enemyAnimSetReady = false;
     state.enemyAnimStatus = "enemy anim: loading";
     for (EnemyClipAsset& clip : state.enemyClipAssets) {
-        clip.model = {};
-        clip.modelLoaded = false;
-        clip.modelScale = 1.0f;
-        clip.modelMinY = 0.0f;
-        clip.modelCenterX = 0.0f;
-        clip.modelCenterZ = 0.0f;
-        clip.anims = nullptr;
-        clip.animCount = 0;
-        clip.animValidForModel = false;
+        unloadEnemyClipAsset(clip);
     }
 
     try {
@@ -476,11 +1341,18 @@ void initEnemyModelAssets(ClientState& state) {
                 return;
             }
             EnemyClipAsset& clip = state.enemyClipAssets[static_cast<size_t>(clipType)];
-            clip.model = LoadModel(path.c_str());
+            FbxModelLoadResult loaded = loadModelAssimpFbx(path);
+            clip.model = loaded.model;
+            clip.anims = loaded.anims;
+            clip.animCount = loaded.animCount;
+            clip.animFps = loaded.animFps;
+            clip.ownedTextures = std::move(loaded.ownedTextures);
+            clip.alphaMeshes = std::move(loaded.alphaMeshes);
             clip.modelLoaded = clip.model.meshCount > 0;
             if (!clip.modelLoaded) {
                 return;
             }
+            clip.sourcePath = path;
             forceVisibleMaterial(clip.model);
             BoundingBox bounds = getModelBounds(clip.model);
             clip.modelMinY = bounds.min.y;
@@ -488,43 +1360,42 @@ void initEnemyModelAssets(ClientState& state) {
             clip.modelCenterZ = (bounds.min.z + bounds.max.z) * 0.5f;
             clip.modelScale = computeEnemyModelScale(bounds);
 
-            clip.anims = LoadModelAnimations(path.c_str(), &clip.animCount);
-            const bool ok = clip.anims != nullptr && clip.animCount > 0;
-            if (ok) {
-                clip.animValidForModel = IsModelAnimationValid(clip.model, clip.anims[0]);
-                if (clip.animValidForModel) {
-                    loadedCount++;
-                }
+            const bool hasAnims = clip.anims != nullptr && clip.animCount > 0;
+            clip.animValidForModel = hasAnims && IsModelAnimationValid(clip.model, clip.anims[0]);
+            if (clip.animValidForModel) {
+                loadedCount++;
             }
         };
         auto tryLoadFirst = [&](EnemyAnimClip clipType, std::initializer_list<const char*> stems) {
             for (const char* stem : stems) {
                 tryLoad(clipType, stem);
-                const EnemyClipAsset& clip = state.enemyClipAssets[static_cast<size_t>(clipType)];
-                if (clip.modelLoaded) {
+                EnemyClipAsset& clip = state.enemyClipAssets[static_cast<size_t>(clipType)];
+                if (clip.modelLoaded && clip.animValidForModel) {
                     return;
+                }
+                if (clip.modelLoaded) {
+                    unloadEnemyClipAsset(clip);
                 }
             }
         };
 
-        // Preferred hand-converted GLB names in /assets, with legacy-name fallbacks.
-        tryLoadFirst(EnemyAnimClip::Idle, {"rifleIdle", "rifledle", "Rifle Idle"});
-        // No dedicated walk clip required: reuse run forward.
-        tryLoadFirst(EnemyAnimClip::WalkForward, {"runForward", "Walk Forward"});
-        tryLoadFirst(EnemyAnimClip::RunForward, {"runForward", "Run Forward"});
-        tryLoadFirst(EnemyAnimClip::RunBackward, {"jumpBackwards", "Run Backwards"});
-        tryLoadFirst(EnemyAnimClip::StrafeLeft, {"walkLeft", "Strafe Left"});
-        tryLoadFirst(EnemyAnimClip::StrafeRight, {"runRight", "Strafe Right"});
-        tryLoadFirst(EnemyAnimClip::Jump, {"rifleJump", "Rifle Jump"});
-        tryLoadFirst(EnemyAnimClip::HitReact, {"HitReaction", "Hit Reaction"});
+        // FBX-only runtime assets in /assets, mapped directly to gameplay actions.
+        tryLoadFirst(EnemyAnimClip::Idle, {"Rifle Idle"});
+        tryLoadFirst(EnemyAnimClip::WalkForward, {"Walk Forward"});
+        tryLoadFirst(EnemyAnimClip::RunForward, {"Run Forward"});
+        tryLoadFirst(EnemyAnimClip::RunBackward, {"Run Backwards"});
+        tryLoadFirst(EnemyAnimClip::StrafeLeft, {"Strafe Left"});
+        tryLoadFirst(EnemyAnimClip::StrafeRight, {"Strafe Right"});
+        tryLoadFirst(EnemyAnimClip::Jump, {"Rifle Jump"});
+        tryLoadFirst(EnemyAnimClip::HitReact, {"Hit Reaction"});
 
         // Only idle is mandatory. Missing clips gracefully fall back at runtime.
         const EnemyClipAsset& idle = state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
-        const bool hasIdle = idle.modelLoaded && idle.anims != nullptr && idle.animCount > 0 && idle.animValidForModel;
+        const bool hasIdle = idle.modelLoaded && idle.animValidForModel;
         state.enemyAnimSetReady = hasIdle;
         state.enemyAnimStatus = state.enemyAnimSetReady
-            ? ("enemy anim: model+clips ready (" + std::to_string(loadedCount) + "/8)")
-            : "enemy anim: idle anim invalid for model";
+            ? ("enemy anim: FBX model+clips ready (" + std::to_string(loadedCount) + "/8) idle=" + idle.sourcePath)
+            : "enemy anim: FBX idle clip unavailable";
     } catch (...) {
         state.enemyAnimSetReady = false;
         state.enemyAnimStatus = "enemy anim: init threw exception";
@@ -796,15 +1667,7 @@ void unloadAssets(ClientState& state) {
     UnloadModel(state.wallModelX);
     UnloadModel(state.wallModelZ);
     for (EnemyClipAsset& clip : state.enemyClipAssets) {
-        if (clip.anims != nullptr && clip.animCount > 0) {
-            UnloadModelAnimations(clip.anims, clip.animCount);
-            clip.anims = nullptr;
-            clip.animCount = 0;
-        }
-        if (clip.modelLoaded) {
-            UnloadModel(clip.model);
-            clip.modelLoaded = false;
-        }
+        unloadEnemyClipAsset(clip);
     }
     state.enemyAnimSetReady = false;
 
@@ -1483,13 +2346,7 @@ void drawPlayerCapsule(const RemotePlayer& player) {
 }
 
 EnemyAnimClip pickEnemyAnim(const RemotePlayer& player, EnemyAnimState& animState, float dt) {
-    (void)player;
-    (void)animState;
-    (void)dt;
-    return EnemyAnimClip::Idle;
-
-    /*
-    const bool airborne = player.position.y > 0.08f;
+    const bool airborne = player.position.y > (animState.wasAirborne ? 0.04f : 0.10f);
     if (player.dead) {
         return EnemyAnimClip::HitReact;
     }
@@ -1506,29 +2363,71 @@ EnemyAnimClip pickEnemyAnim(const RemotePlayer& player, EnemyAnimState& animStat
     const arena::Vec3 velocity = animState.hasLastPosition && dt > 0.0001f
         ? (player.position - animState.lastPosition) * (1.0f / dt)
         : arena::Vec3{};
-    const float speed = std::sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
-    animState.estimatedSpeed = speed;
-    if (speed < 0.45f) {
+    const float rawSpeed = std::sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+    const float smoothT = animState.hasLastPosition ? std::clamp(dt * 12.0f, 0.0f, 1.0f) : 1.0f;
+    animState.smoothedVelocity.x += (velocity.x - animState.smoothedVelocity.x) * smoothT;
+    animState.smoothedVelocity.y = 0.0f;
+    animState.smoothedVelocity.z += (velocity.z - animState.smoothedVelocity.z) * smoothT;
+    animState.smoothedSpeed = std::sqrt(
+        animState.smoothedVelocity.x * animState.smoothedVelocity.x +
+        animState.smoothedVelocity.z * animState.smoothedVelocity.z);
+    animState.estimatedSpeed = animState.smoothedSpeed;
+
+    const bool activeIdle = animState.activeClip == EnemyAnimClip::Idle;
+    const float idleThreshold = activeIdle ? 0.72f : 0.28f;
+    if (animState.smoothedSpeed < idleThreshold) {
         return EnemyAnimClip::Idle;
     }
-    const float moveForward = arena::dot(velocity, forward);
-    const float moveRight = arena::dot(velocity, right);
-    if (std::abs(moveRight) > std::abs(moveForward) * 1.08f) {
+
+    if (rawSpeed < 0.08f) {
+        switch (animState.activeClip) {
+        case EnemyAnimClip::WalkForward:
+        case EnemyAnimClip::RunForward:
+        case EnemyAnimClip::RunBackward:
+        case EnemyAnimClip::StrafeLeft:
+        case EnemyAnimClip::StrafeRight:
+            return animState.activeClip;
+        default:
+            return EnemyAnimClip::WalkForward;
+        }
+    }
+
+    const float moveForward = arena::dot(animState.smoothedVelocity, forward);
+    const float moveRight = arena::dot(animState.smoothedVelocity, right);
+    const float absForward = std::abs(moveForward);
+    const float absRight = std::abs(moveRight);
+    const float directionalSpeed = std::max(0.001f, std::sqrt(absForward * absForward + absRight * absRight));
+    const float lateralShare = absRight / directionalSpeed;
+    const bool activeStrafe = animState.activeClip == EnemyAnimClip::StrafeLeft ||
+        animState.activeClip == EnemyAnimClip::StrafeRight;
+    if (absRight > (activeStrafe ? 0.25f : 0.35f) &&
+        lateralShare > (activeStrafe ? 0.34f : 0.42f)) {
         return moveRight > 0.0f ? EnemyAnimClip::StrafeRight : EnemyAnimClip::StrafeLeft;
     }
-    if (moveForward < -0.25f) {
+    const bool activeBackward = animState.activeClip == EnemyAnimClip::RunBackward;
+    if (moveForward < -(activeBackward ? 0.30f : 0.42f) && absForward >= absRight * 0.85f) {
         return EnemyAnimClip::RunBackward;
     }
-    if (speed > 4.6f) {
+    const bool activeRun = animState.activeClip == EnemyAnimClip::RunForward;
+    if (moveForward > -0.20f && animState.smoothedSpeed > (activeRun ? 4.1f : 5.0f)) {
         return EnemyAnimClip::RunForward;
     }
     return EnemyAnimClip::WalkForward;
-    */
 }
 
 void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const RemotePlayer& player, float dt) {
+    sanitizeEnemyTune(state);
     EnemyAnimState& animState = state.enemyAnimStateById[playerId];
-    EnemyClipAsset* renderClip = &state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
+    const bool airborne = player.position.y > 0.08f;
+    auto finishAnimSample = [&]() {
+        animState.lastPosition = player.position;
+        animState.hasLastPosition = true;
+        animState.wasAirborne = airborne;
+    };
+
+    const EnemyAnimClip desiredClip = pickEnemyAnim(player, animState, dt);
+    EnemyClipAsset* renderClip = nullptr;
+    EnemyAnimClip renderClipType = desiredClip;
     auto clipLooksDrawable = [](const EnemyClipAsset& c) {
         if (!c.modelLoaded || c.model.meshCount <= 0 || c.model.meshes == nullptr) {
             return false;
@@ -1540,14 +2439,57 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
         return std::isfinite(sx) && std::isfinite(sy) && std::isfinite(sz) &&
             sx > 0.00001f && sy > 0.00001f && sz > 0.00001f;
     };
+    auto clipHasPlayableAnim = [](const EnemyClipAsset& c) {
+        return c.modelLoaded && c.animValidForModel && c.anims != nullptr && c.animCount > 0;
+    };
+
+    auto usePlayableClip = [&](EnemyAnimClip clipType) {
+        renderClipType = clipType;
+        renderClip = &state.enemyClipAssets[static_cast<size_t>(renderClipType)];
+        if (!clipLooksDrawable(*renderClip) || !clipHasPlayableAnim(*renderClip)) {
+            renderClipType = EnemyAnimClip::Idle;
+            renderClip = &state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
+        }
+    };
+    usePlayableClip(desiredClip);
+
+    if (renderClipType != animState.activeClip) {
+        if (renderClipType != animState.pendingClip) {
+            animState.pendingClip = renderClipType;
+            animState.pendingClipTime = 0.0f;
+        }
+        animState.pendingClipTime += std::max(dt, 0.0f);
+        const bool immediateSwitch = renderClipType == EnemyAnimClip::Jump ||
+            renderClipType == EnemyAnimClip::HitReact ||
+            animState.activeClip == EnemyAnimClip::Jump ||
+            animState.activeClip == EnemyAnimClip::HitReact;
+        if (immediateSwitch || animState.pendingClipTime >= 0.12f) {
+            animState.activeClip = renderClipType;
+            animState.pendingClip = renderClipType;
+            animState.pendingClipTime = 0.0f;
+            animState.frame = 0.0f;
+        } else {
+            usePlayableClip(animState.activeClip);
+            if (renderClipType != animState.activeClip) {
+                animState.activeClip = renderClipType;
+                animState.pendingClip = renderClipType;
+                animState.pendingClipTime = 0.0f;
+                animState.frame = 0.0f;
+            }
+        }
+    } else {
+        animState.pendingClip = renderClipType;
+        animState.pendingClipTime = 0.0f;
+    }
     if (!clipLooksDrawable(*renderClip)) {
         state.enemyModelDebug = "enemy model debug: idle model not loaded";
+        finishAnimSample();
         return;
     }
-    constexpr bool kEnableRemoteEnemyAnimation = false;
+    constexpr bool kEnableRemoteEnemyAnimation = true;
     if (kEnableRemoteEnemyAnimation && renderClip->anims != nullptr && renderClip->animCount > 0 && renderClip->animValidForModel) {
         ModelAnimation& anim = renderClip->anims[0];
-        const float fps = firstAnimFpsOrDefault(renderClip->anims, renderClip->animCount);
+        const float fps = (renderClip->animFps > 0.0f) ? renderClip->animFps : firstAnimFpsOrDefault(renderClip->anims, renderClip->animCount);
         animState.frame += fps * dt;
         if (anim.frameCount > 0) {
             while (animState.frame >= static_cast<float>(anim.frameCount)) {
@@ -1563,29 +2505,20 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
     const float dbgSizeY = dbgBounds.max.y - dbgBounds.min.y;
     const float dbgSizeZ = dbgBounds.max.z - dbgBounds.min.z;
 
-    const float scaleY = renderClip->modelScale * state.enemyTuneScale;
+    const float scaleY = renderClip->modelScale;
     const float scaleXZ = scaleY;
 
-    // Model space yaw is mirrored relative to gameplay yaw for this rig/import path.
-    const float totalYawDeg = (-player.yaw * RAD2DEG) + state.enemyTuneRotY;
-    const Matrix yawOnly = MatrixRotateY(totalYawDeg * DEG2RAD);
-    const Vector3 localPivotOffset{
-        renderClip->modelCenterX * scaleXZ,
-        renderClip->modelMinY * scaleY,
-        renderClip->modelCenterZ * scaleXZ};
-    const Vector3 worldPivotOffset = Vector3Transform(localPivotOffset, yawOnly);
-    const Vector3 localTuneOffset{
-        state.enemyTuneOffsetX,
-        state.enemyTuneOffsetY,
-        state.enemyTuneOffsetZ};
-    const Vector3 worldTuneOffset = Vector3Transform(localTuneOffset, yawOnly);
+    // Visibility-first transform for reliable in-game validation.
+    // Anchor feet to player position and rotate only around yaw.
+    const float totalYawDeg = (-player.yaw * RAD2DEG) + 180.0f;
     Vector3 drawPos{
-        player.position.x - worldPivotOffset.x + worldTuneOffset.x,
-        player.position.y - worldPivotOffset.y + worldTuneOffset.y,
-        player.position.z - worldPivotOffset.z + worldTuneOffset.z
+        player.position.x,
+        player.position.y - (renderClip->modelMinY * scaleY),
+        player.position.z
     };
     if (!std::isfinite(drawPos.x) || !std::isfinite(drawPos.y) || !std::isfinite(drawPos.z) || !std::isfinite(renderClip->modelScale)) {
         state.enemyModelDebug = "enemy model debug: non-finite transform";
+        finishAnimSample();
         return;
     }
     state.enemyModelDebug = "enemy model debug: mesh=" + std::to_string(renderClip->model.meshCount) +
@@ -1600,17 +2533,18 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
         " drawY=" + std::to_string(drawPos.y) +
         " yaw=" + std::to_string(totalYawDeg) +
         " frame=" + std::to_string(animState.frame) +
-        " anim=" + std::string(kEnableRemoteEnemyAnimation ? "on" : "off");
-    const Vector3 eulerDeg{
-        state.enemyTuneRotX,
-        totalYawDeg,
-        state.enemyTuneRotZ};
+        " anim=" + std::string(kEnableRemoteEnemyAnimation ? "on" : "off") +
+        " clip=" + std::to_string(static_cast<int>(renderClipType)) +
+        " src=" + renderClip->sourcePath;
+    const Vector3 eulerDeg{0.0f, totalYawDeg, 0.0f};
     drawModelEuler(
         renderClip->model,
         drawPos,
         eulerDeg,
         Vector3{scaleXZ, scaleY, scaleXZ},
-        WHITE);
+        WHITE,
+        &renderClip->alphaMeshes);
+    finishAnimSample();
 }
 
 void drawRemoteWeaponProxy(const RemotePlayer& player) {
@@ -1621,8 +2555,15 @@ void drawRemoteWeaponProxy(const RemotePlayer& player) {
     const float eyeHeight = player.crouched ? arena::CrouchEyeHeight : arena::StandEyeHeight;
     const Vector3 eye{player.position.x, player.position.y + eyeHeight, player.position.z};
     const Vector3 forward = cameraForward(player.yaw, player.pitch);
-    // Keep proxy centered on the same axis used by server raycast: eye + forward.
-    const Vector3 grip = Vector3Add(eye, Vector3Scale(forward, 0.22f));
+    const Vector3 right{
+        static_cast<float>(std::cos(player.yaw)),
+        0.0f,
+        static_cast<float>(std::sin(player.yaw))
+    };
+    const float shoulderDrop = player.crouched ? 0.18f : 0.32f;
+    const Vector3 grip = Vector3Add(
+        Vector3Add(eye, Vector3Scale(right, 0.24f)),
+        Vector3Add(Vector3{0.0f, -shoulderDrop, 0.0f}, Vector3Scale(forward, 0.24f)));
 
     if (player.weaponSlot == static_cast<uint8_t>(WeaponSlot::Knife)) {
         const Vector3 handleEnd = Vector3Add(grip, Vector3Scale(forward, 0.18f));
@@ -1687,7 +2628,7 @@ void cleanupMissingEnemyAnimState(ClientState& state) {
 void drawIdleEnemyModelPreview(ClientState& state, float dt) {
     const size_t idleIndex = static_cast<size_t>(EnemyAnimClip::Idle);
     EnemyClipAsset& idle = state.enemyClipAssets[idleIndex];
-    if (!idle.modelLoaded || idle.anims == nullptr || idle.animCount <= 0) {
+    if (!idle.modelLoaded) {
         return;
     }
 
@@ -1695,7 +2636,7 @@ void drawIdleEnemyModelPreview(ClientState& state, float dt) {
     static float previewFrame = 0.0f;
     if (idle.animValidForModel) {
         ModelAnimation& anim = idle.anims[0];
-        const float fps = firstAnimFpsOrDefault(idle.anims, idle.animCount);
+        const float fps = (idle.animFps > 0.0f) ? idle.animFps : firstAnimFpsOrDefault(idle.anims, idle.animCount);
         previewFrame += fps * dt;
         if (anim.frameCount > 0) {
             while (previewFrame >= static_cast<float>(anim.frameCount)) {
@@ -1711,13 +2652,13 @@ void drawIdleEnemyModelPreview(ClientState& state, float dt) {
         0.0f - idle.modelMinY * idle.modelScale,
         0.0f
     };
-    DrawModelEx(
+    drawModelEuler(
         idle.model,
         drawPos,
-        Vector3{0.0f, 1.0f, 0.0f},
-        180.0f,
+        Vector3{0.0f, 180.0f, 0.0f},
         Vector3{idle.modelScale, idle.modelScale, idle.modelScale},
-        WHITE);
+        WHITE,
+        &idle.alphaMeshes);
 }
 
 void updateViewmodelAndFootsteps(ClientState& state, double now, float dt) {
@@ -2251,16 +3192,25 @@ void render(ClientState& state, double now) {
         ? "Connected as " + state.localPlayerName + " (#" + std::to_string(state.localPlayerId) + ") | players: " + std::to_string(state.players.size())
         : "Connecting to server...";
     DrawText(status.c_str(), 16, GetScreenHeight() - 58, 20, RAYWHITE);
+    sanitizeEnemyTune(state);
     if (!state.enemyAnimSetReady) {
         DrawText(state.enemyAnimStatus.c_str(), 16, GetScreenHeight() - 82, 18, Color{255, 130, 130, 255});
     }
+    const EnemyClipAsset& idleClipDbg = state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
+    std::string srcLabel = "enemy src: n/a";
+    if (!idleClipDbg.sourcePath.empty()) {
+        const size_t slash = idleClipDbg.sourcePath.find_last_of("\\/");
+        const std::string file = (slash == std::string::npos) ? idleClipDbg.sourcePath : idleClipDbg.sourcePath.substr(slash + 1);
+        srcLabel = "enemy src: " + file;
+    }
+    DrawText(srcLabel.c_str(), 16, GetScreenHeight() - 178, 18, Color{255, 180, 120, 255});
     DrawText(state.enemyModelDebug.c_str(), 16, GetScreenHeight() - 106, 18, Color{190, 225, 255, 255});
     const std::string enemyTuneHud =
         "enemy tune: scale=" + std::to_string(state.enemyTuneScale) +
         " off(" + std::to_string(state.enemyTuneOffsetX) + "," + std::to_string(state.enemyTuneOffsetY) + "," + std::to_string(state.enemyTuneOffsetZ) + ")" +
         " rot(" + std::to_string(state.enemyTuneRotX) + "," + std::to_string(state.enemyTuneRotY) + "," + std::to_string(state.enemyTuneRotZ) + ")";
     DrawText(enemyTuneHud.c_str(), 16, GetScreenHeight() - 130, 18, Color{255, 210, 130, 255});
-    DrawText("I/O scale+/- | J/K x-/x+ | N/M y+/y- | L/P z-/z+ | 8/9/0 rot +90 | 7/U rotX-/+ | Y/H rotY-/+ | B/V rotZ-/+", 16, GetScreenHeight() - 154, 18, Color{255, 210, 130, 255});
+    DrawText("I/O scale+/- | J/K x-/x+ | N/M y+/y- | L/P z-/z+ | 8/9/0 rot +90 | 7/U rotX-/+ | Y/H rotY-/+ | B/V rotZ-/+ | T reset", 16, GetScreenHeight() - 154, 18, Color{255, 210, 130, 255});
 
     const std::string t1Clock = formatClock(state.team1TimeLeftSeconds);
     const std::string t2Clock = formatClock(state.team2TimeLeftSeconds);
@@ -2457,6 +3407,10 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_V)) {
                 state.enemyTuneRotZ = std::fmod(state.enemyTuneRotZ + FineRotStep, 360.0f);
             }
+            if (IsKeyPressed(KEY_T)) {
+                resetEnemyTune(state);
+            }
+            sanitizeEnemyTune(state);
             if (IsKeyPressed(KEY_ESCAPE)) {
                 state.screenMode = ScreenMode::MainMenu;
                 if (state.lightningLoopPlaying && state.lightningAudioLoaded) {

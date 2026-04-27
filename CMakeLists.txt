@@ -17,6 +17,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(raylib)
 
+set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
+set(ASSIMP_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    assimp
+    GIT_REPOSITORY https://github.com/assimp/assimp.git
+    GIT_TAG v6.0.4
+)
+FetchContent_MakeAvailable(assimp)
+
 add_executable(arena_server
     src/server.cpp
 )
@@ -27,7 +38,7 @@ add_executable(arena_client
 
 if (WIN32)
     target_link_libraries(arena_server PRIVATE ws2_32)
-    target_link_libraries(arena_client PRIVATE ws2_32 raylib)
+    target_link_libraries(arena_client PRIVATE ws2_32 raylib assimp::assimp)
 else()
     message(FATAL_ERROR "This demo currently targets Windows because the networking layer uses Winsock.")
 endif()
