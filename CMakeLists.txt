@@ -42,7 +42,7 @@ add_executable(arena_client
 )
 
 if (WIN32)
-    target_link_libraries(arena_server PRIVATE ws2_32)
+    target_link_libraries(arena_server PRIVATE ws2_32 assimp::assimp)
     target_link_libraries(arena_client PRIVATE ws2_32 raylib assimp::assimp)
 else()
     message(FATAL_ERROR "This demo currently targets Windows because the networking layer uses Winsock.")

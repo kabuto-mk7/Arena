@@ -27,8 +27,8 @@
 
 namespace {
 
-constexpr int WindowWidth = 1920;
-constexpr int WindowHeight = 1080;
+constexpr int WindowWidth = 1280;
+constexpr int WindowHeight = 720;
 #if defined(NDEBUG)
 constexpr bool ShowBottomDebugOverlay = false;
 #else
@@ -76,6 +76,12 @@ enum class ScreenMode {
     MainMenu,
     Settings,
     InGame
+};
+
+enum class DisplayMode {
+    Windowed = 0,
+    Borderless = 1,
+    Fullscreen = 2
 };
 
 struct RemotePlayer {
@@ -128,6 +134,8 @@ struct EnemyAnimState {
     EnemyAnimClip pendingClip = EnemyAnimClip::Idle;
     float pendingClipTime = 0.0f;
     float frame = 0.0f;
+    float animUpdateAccumulator = 0.0f;
+    int lastAppliedAnimFrame = -1;
 };
 
 struct EnemyClipAsset {
@@ -290,6 +298,20 @@ struct KillFeedEntry {
     float lifetime = 2.0f;
 };
 
+struct ResolutionPreset {
+    int width = 1280;
+    int height = 720;
+};
+
+constexpr std::array<ResolutionPreset, 6> ResolutionPresets{{
+    {1280, 720},
+    {1366, 768},
+    {1600, 900},
+    {1920, 1080},
+    {2560, 1440},
+    {3840, 2160}
+}};
+
 struct ClientState {
     SOCKET socket = INVALID_SOCKET;
     sockaddr_in serverAddress{};
@@ -297,6 +319,8 @@ struct ClientState {
     ScreenMode screenMode = ScreenMode::MainMenu;
     int menuIndex = 0;
     int settingsIndex = 0;
+    int resolutionIndex = 0;
+    DisplayMode displayMode = DisplayMode::Windowed;
     float mouseSensitivity = DefaultMouseSensitivity;
     bool hitSoundEnabled = true;
     float hitSoundVolume = 0.65f;
@@ -327,6 +351,8 @@ struct ClientState {
     bool menuBackgroundLoaded = false;
     Texture2D logoTexture{};
     bool logoLoaded = false;
+    Font uiFont{};
+    bool uiFontLoaded = false;
     std::array<Texture2D, 8> shotgunFrames{};
     int shotgunFrameCount = 0;
     Texture2D lightningGunIdle{};
@@ -343,6 +369,11 @@ struct ClientState {
     Model ceilingModel{};
     Model wallModelX{};
     Model wallModelZ{};
+    Model mapModel{};
+    bool mapModelLoaded = false;
+    float mapModelScale = 3.879997f;
+    Vector3 mapModelOffset{0.0f, -4.0f, 0.0f};
+    Vector3 mapModelRotationDeg{270.0f, 0.0f, 0.0f};
     std::array<EnemyClipAsset, static_cast<size_t>(EnemyAnimClip::Count)> enemyClipAssets{};
     bool enemyAnimSetReady = false;
     std::string enemyAnimStatus = "enemy anim: not initialized";
@@ -377,6 +408,15 @@ struct ClientState {
     int hitSoundAliasNext = 0;
     std::array<Sound, 4> footstepSounds{};
     int footstepSoundCount = 0;
+    std::array<Sound, 16> announcerSounds{};
+    std::array<uint8_t, 16> announcerSoundLoaded{};
+    Sound announcerWeCaptured{};
+    Sound announcerWeLost{};
+    bool announcerWeCapturedLoaded = false;
+    bool announcerWeLostLoaded = false;
+    uint32_t lastAnnouncerSeqHeard = 0;
+    std::string serverAnnouncementText{};
+    double serverAnnouncementUntil = 0.0;
 
     double nextFootstepAt = 0.0;
     WeaponAnimMode weaponAnimMode = WeaponAnimMode::Idle;
@@ -435,6 +475,84 @@ struct ClientState {
     float mapOriginZ = 0.0f;
     std::array<char, arena::MapMaxWidth * arena::MapMaxHeight> mapCells{};
 };
+
+Font* gUiFont = nullptr;
+
+int UiMeasureText(const char* text, int fontSize) {
+    if (gUiFont != nullptr && gUiFont->texture.id != 0) {
+        const Vector2 size = MeasureTextEx(*gUiFont, text, static_cast<float>(fontSize), 1.0f);
+        return static_cast<int>(std::round(size.x));
+    }
+    return ::MeasureText(text, fontSize);
+}
+
+void UiDrawText(const char* text, int posX, int posY, int fontSize, Color color) {
+    if (gUiFont != nullptr && gUiFont->texture.id != 0) {
+        DrawTextEx(*gUiFont, text, Vector2{static_cast<float>(posX), static_cast<float>(posY)}, static_cast<float>(fontSize), 1.0f, color);
+        return;
+    }
+    ::DrawText(text, posX, posY, fontSize, color);
+}
+
+#define MeasureText UiMeasureText
+#define DrawText UiDrawText
+
+size_t announcerIndex(arena::AnnouncerEvent event) {
+    return static_cast<size_t>(event);
+}
+
+void playAnnouncer(ClientState& state, arena::AnnouncerEvent event) {
+    const size_t idx = announcerIndex(event);
+    if (!state.audioReady || idx >= state.announcerSounds.size() || state.announcerSoundLoaded[idx] == 0) {
+        return;
+    }
+    PlaySound(state.announcerSounds[idx]);
+}
+
+const char* announcerEventLabel(arena::AnnouncerEvent event) {
+    switch (event) {
+    case arena::AnnouncerEvent::DoubleKill: return "DOUBLE KILL";
+    case arena::AnnouncerEvent::TripleKill: return "TRIPLE KILL";
+    case arena::AnnouncerEvent::QuadKill: return "QUAD KILL";
+    case arena::AnnouncerEvent::PentaKill: return "PENTA KILL";
+    case arena::AnnouncerEvent::Godlike: return "GODLIKE";
+    default: return "";
+    }
+}
+
+const char* displayModeName(DisplayMode mode) {
+    switch (mode) {
+    case DisplayMode::Windowed: return "Windowed";
+    case DisplayMode::Borderless: return "Borderless";
+    case DisplayMode::Fullscreen: return "Fullscreen";
+    default: return "Windowed";
+    }
+}
+
+void applyDisplayMode(ClientState& state, DisplayMode mode) {
+    const ResolutionPreset preset = ResolutionPresets[static_cast<size_t>(state.resolutionIndex)];
+    const int monitor = GetCurrentMonitor();
+    const int monitorWidth = GetMonitorWidth(monitor);
+    const int monitorHeight = GetMonitorHeight(monitor);
+
+    ClearWindowState(FLAG_FULLSCREEN_MODE);
+    ClearWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
+
+    if (mode == DisplayMode::Fullscreen) {
+        SetWindowSize(monitorWidth, monitorHeight);
+        SetWindowPosition(0, 0);
+        SetWindowState(FLAG_FULLSCREEN_MODE);
+    } else if (mode == DisplayMode::Borderless) {
+        SetWindowSize(monitorWidth, monitorHeight);
+        SetWindowPosition(0, 0);
+        SetWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
+    } else {
+        SetWindowSize(preset.width, preset.height);
+        SetWindowPosition(std::max(0, (monitorWidth - preset.width) / 2), std::max(0, (monitorHeight - preset.height) / 2));
+    }
+
+    state.displayMode = mode;
+}
 
 void resetEnemyTune(ClientState& state) {
     state.enemyTuneScale = 1.2f;
@@ -1485,6 +1603,18 @@ void initAssets(ClientState& state) {
     } catch (...) {
         state.logoLoaded = false;
     }
+    try {
+        const std::string fontPath = resolveAssetPath("assets\\fonts\\SilentHunterIII Font.ttf");
+        state.uiFont = LoadFontEx(fontPath.c_str(), 96, nullptr, 0);
+        state.uiFontLoaded = state.uiFont.texture.id != 0;
+        if (state.uiFontLoaded) {
+            SetTextureFilter(state.uiFont.texture, TEXTURE_FILTER_BILINEAR);
+            gUiFont = &state.uiFont;
+        }
+    } catch (...) {
+        state.uiFontLoaded = false;
+        gUiFont = nullptr;
+    }
 
     Mesh floorMesh = GenMeshPlane(arena::RoomHalfSize * 2.0f, arena::RoomHalfSize * 2.0f, 32, 32);
     Mesh ceilingMesh = GenMeshPlane(arena::RoomHalfSize * 2.0f, arena::RoomHalfSize * 2.0f, 32, 32);
@@ -1609,6 +1739,41 @@ void initAssets(ClientState& state) {
     state.footstepSounds[2] = loadSoundAsset("assets\\sound\\boots3.wav");
     state.footstepSounds[3] = loadSoundAsset("assets\\sound\\boots4.wav");
     state.footstepSoundCount = 4;
+    state.announcerSoundLoaded.fill(0);
+    auto loadAnnouncer = [&](arena::AnnouncerEvent event, const char* path) {
+        try {
+            const size_t idx = announcerIndex(event);
+            state.announcerSounds[idx] = loadSoundAsset(path);
+            state.announcerSoundLoaded[idx] = (state.announcerSounds[idx].stream.buffer != nullptr) ? 1 : 0;
+        } catch (...) {
+            // Optional content: skip missing announcer clips.
+        }
+    };
+    loadAnnouncer(arena::AnnouncerEvent::DoubleKill, "assets\\sound\\announcer\\[Half-Life VOX]Doubl...... kill_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::TripleKill, "assets\\sound\\announcer\\[Half-Life VOX]Tripl......kill!_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::QuadKill, "assets\\sound\\announcer\\[Half-Life VOX]Quadr......kill!_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::PentaKill, "assets\\sound\\announcer\\[Half-Life VOX]Penta......kill!_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::Godlike, "assets\\sound\\announcer\\[Half-Life VOX]Godlike_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::Overtime, "assets\\sound\\announcer\\[Half-Life VOX]Overt......me..._8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::Victory, "assets\\sound\\announcer\\[Half-Life VOX]Victory..._8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::Defeat, "assets\\sound\\announcer\\[Half-Life VOX]Defeat..._8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::CountOne, "assets\\sound\\announcer\\[Half-Life VOX]One_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::CountTwo, "assets\\sound\\announcer\\[Half-Life VOX]Two_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::CountThree, "assets\\sound\\announcer\\[Half-Life VOX]Three_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::CountFour, "assets\\sound\\announcer\\[Half-Life VOX]Four_8000hz.mp3");
+    loadAnnouncer(arena::AnnouncerEvent::CountFive, "assets\\sound\\announcer\\[Half-Life VOX]Five_8000hz.mp3");
+    try {
+        state.announcerWeCaptured = loadSoundAsset("assets\\sound\\announcer\\[Half-Life VOX]We ha......oint._8000hz.mp3");
+        state.announcerWeCapturedLoaded = state.announcerWeCaptured.stream.buffer != nullptr;
+    } catch (...) {
+        state.announcerWeCapturedLoaded = false;
+    }
+    try {
+        state.announcerWeLost = loadSoundAsset("assets\\sound\\announcer\\[Half-Life VOX]We ha......oint.(1)_8000hz.mp3");
+        state.announcerWeLostLoaded = state.announcerWeLost.stream.buffer != nullptr;
+    } catch (...) {
+        state.announcerWeLostLoaded = false;
+    }
 
     state.ammoPacks = {
         {{-12.0f, 0.35f, -10.0f}, true},
@@ -1661,6 +1826,20 @@ void unloadAssets(ClientState& state) {
         for (int i = 0; i < state.footstepSoundCount; ++i) {
             UnloadSound(state.footstepSounds[i]);
         }
+        for (size_t i = 0; i < state.announcerSounds.size(); ++i) {
+            if (state.announcerSoundLoaded[i] != 0) {
+                UnloadSound(state.announcerSounds[i]);
+                state.announcerSoundLoaded[i] = 0;
+            }
+        }
+        if (state.announcerWeCapturedLoaded) {
+            UnloadSound(state.announcerWeCaptured);
+            state.announcerWeCapturedLoaded = false;
+        }
+        if (state.announcerWeLostLoaded) {
+            UnloadSound(state.announcerWeLost);
+            state.announcerWeLostLoaded = false;
+        }
         CloseAudioDevice();
         state.audioReady = false;
     }
@@ -1703,6 +1882,11 @@ void unloadAssets(ClientState& state) {
     }
     if (state.logoLoaded && state.logoTexture.id != 0) {
         UnloadTexture(state.logoTexture);
+    }
+    if (state.uiFontLoaded && state.uiFont.texture.id != 0) {
+        gUiFont = nullptr;
+        UnloadFont(state.uiFont);
+        state.uiFontLoaded = false;
     }
     state.assetsLoaded = false;
 }
@@ -1887,7 +2071,7 @@ void drawMainMenu(ClientState& state) {
     bool settingsClicked = drawMenuButton(buttons[1], "Settings", state.menuIndex == 1);
     bool quitClicked = drawMenuButton(buttons[2], "Quit Game", state.menuIndex == 2);
 
-    const bool activate = IsKeyPressed(KEY_ENTER);
+    const bool activate = IsKeyPressed(KEY_ENTER) && !keyDown(KEY_LEFT_ALT) && !keyDown(KEY_RIGHT_ALT);
     if (joinClicked || (activate && state.menuIndex == 0)) {
         state.desiredJoinName = trimForJoinName(state.desiredJoinName);
         state.screenMode = ScreenMode::InGame;
@@ -1928,19 +2112,42 @@ void drawSettingsMenu(ClientState& state) {
     const float columnW = std::min(460.0f, sw * 0.26f);
     DrawText("Settings", static_cast<int>(columnX + (columnW - MeasureText("Settings", 72)) * 0.5f), 120, 72, Color{228, 236, 255, 255});
 
-    if (IsKeyPressed(KEY_UP)) state.settingsIndex = (state.settingsIndex + 2) % 3;
-    if (IsKeyPressed(KEY_DOWN)) state.settingsIndex = (state.settingsIndex + 1) % 3;
+    constexpr int SettingsRowCount = 5;
+    if (IsKeyPressed(KEY_UP)) state.settingsIndex = (state.settingsIndex + SettingsRowCount - 1) % SettingsRowCount;
+    if (IsKeyPressed(KEY_DOWN)) state.settingsIndex = (state.settingsIndex + 1) % SettingsRowCount;
 
     const bool leftAdjust = IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A);
     const bool rightAdjust = IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D);
-    const bool toggle = IsKeyPressed(KEY_ENTER);
+    const bool toggle = IsKeyPressed(KEY_ENTER) && !keyDown(KEY_LEFT_ALT) && !keyDown(KEY_RIGHT_ALT);
 
     if (state.settingsIndex == 0) {
+        if (leftAdjust) {
+            state.resolutionIndex = (state.resolutionIndex + static_cast<int>(ResolutionPresets.size()) - 1) % static_cast<int>(ResolutionPresets.size());
+            if (state.displayMode == DisplayMode::Windowed) {
+                applyDisplayMode(state, DisplayMode::Windowed);
+            }
+        }
+        if (rightAdjust) {
+            state.resolutionIndex = (state.resolutionIndex + 1) % static_cast<int>(ResolutionPresets.size());
+            if (state.displayMode == DisplayMode::Windowed) {
+                applyDisplayMode(state, DisplayMode::Windowed);
+            }
+        }
+    } else if (state.settingsIndex == 1) {
+        if (leftAdjust) {
+            const int mode = (static_cast<int>(state.displayMode) + 2) % 3;
+            applyDisplayMode(state, static_cast<DisplayMode>(mode));
+        }
+        if (rightAdjust || toggle) {
+            const int mode = (static_cast<int>(state.displayMode) + 1) % 3;
+            applyDisplayMode(state, static_cast<DisplayMode>(mode));
+        }
+    } else if (state.settingsIndex == 2) {
         if (leftAdjust) state.mouseSensitivity = std::max(0.0003f, state.mouseSensitivity - 0.0001f);
         if (rightAdjust) state.mouseSensitivity = std::min(0.006f, state.mouseSensitivity + 0.0001f);
-    } else if (state.settingsIndex == 1) {
+    } else if (state.settingsIndex == 3) {
         if (leftAdjust || rightAdjust || toggle) state.hitSoundEnabled = !state.hitSoundEnabled;
-    } else if (state.settingsIndex == 2) {
+    } else if (state.settingsIndex == 4) {
         if (leftAdjust) state.hitSoundVolume = std::max(0.0f, state.hitSoundVolume - 0.05f);
         if (rightAdjust) state.hitSoundVolume = std::min(1.0f, state.hitSoundVolume + 0.05f);
         if (state.hitSoundLoaded) {
@@ -1960,12 +2167,16 @@ void drawSettingsMenu(ClientState& state) {
         DrawText(value, static_cast<int>(columnX + columnW - vw - 24.0f), static_cast<int>(y), 32, valueColor);
     };
 
-    drawSettingRow(0, 272.0f, "Mouse Sensitivity", TextFormat("%.4f", state.mouseSensitivity));
-    drawSettingRow(1, 336.0f, "Hit Sound", state.hitSoundEnabled ? "On" : "Off");
-    drawSettingRow(2, 400.0f, "Hit Volume", TextFormat("%d%%", static_cast<int>(std::round(state.hitSoundVolume * 100.0f))));
+    const ResolutionPreset selectedRes = ResolutionPresets[static_cast<size_t>(state.resolutionIndex)];
+    drawSettingRow(0, 240.0f, "Resolution", TextFormat("%dx%d", selectedRes.width, selectedRes.height));
+    drawSettingRow(1, 304.0f, "Display Mode", displayModeName(state.displayMode));
+    drawSettingRow(2, 368.0f, "Mouse Sensitivity", TextFormat("%.4f", state.mouseSensitivity));
+    drawSettingRow(3, 432.0f, "Hit Sound", state.hitSoundEnabled ? "On" : "Off");
+    drawSettingRow(4, 496.0f, "Hit Volume", TextFormat("%d%%", static_cast<int>(std::round(state.hitSoundVolume * 100.0f))));
 
-    DrawText("Up/Down to select | Left/Right to adjust", static_cast<int>(columnX + (columnW - MeasureText("Up/Down to select | Left/Right to adjust", 24)) * 0.5f), 470, 24, Color{172, 178, 192, 255});
-    DrawText("Press Esc to return", static_cast<int>(columnX + (columnW - MeasureText("Press Esc to return", 24)) * 0.5f), 504, 24, Color{172, 178, 192, 255});
+    DrawText("Up/Down to select | Left/Right to adjust", static_cast<int>(columnX + (columnW - MeasureText("Up/Down to select | Left/Right to adjust", 24)) * 0.5f), 570, 24, Color{172, 178, 192, 255});
+    DrawText("Alt+Enter toggles Borderless/Fullscreen", static_cast<int>(columnX + (columnW - MeasureText("Alt+Enter toggles Borderless/Fullscreen", 24)) * 0.5f), 604, 24, Color{172, 178, 192, 255});
+    DrawText("Press Esc to return", static_cast<int>(columnX + (columnW - MeasureText("Press Esc to return", 24)) * 0.5f), 638, 24, Color{172, 178, 192, 255});
 
     if (IsKeyPressed(KEY_ESCAPE)) {
         state.screenMode = ScreenMode::MainMenu;
@@ -2132,6 +2343,7 @@ void pumpNetwork(ClientState& state) {
                 }
             }
             cleanupMissingEnemyAnimState(state);
+            const uint8_t previousHillOwnerTeam = state.hillOwnerTeam;
             state.team1TimeLeftSeconds = packet.team1TimeLeftSeconds;
             state.team2TimeLeftSeconds = packet.team2TimeLeftSeconds;
             state.hillOwnerTeam = packet.hillOwnerTeam;
@@ -2144,6 +2356,39 @@ void pumpNetwork(ClientState& state) {
             state.matchWinnerTeam = packet.matchWinnerTeam;
             state.matchResetSecondsLeft = packet.matchResetSecondsLeft;
             state.hillCaptureProgress = packet.hillCaptureProgress;
+
+            if (packet.announcerSeq != state.lastAnnouncerSeqHeard) {
+                state.lastAnnouncerSeqHeard = packet.announcerSeq;
+                const arena::AnnouncerEvent event = static_cast<arena::AnnouncerEvent>(packet.announcerEvent);
+                playAnnouncer(state, event);
+                const char* eventLabel = announcerEventLabel(event);
+                if (eventLabel[0] != '\0' && packet.announcerActorPlayerId != 0) {
+                    std::string actorName = "Player " + std::to_string(packet.announcerActorPlayerId);
+                    const auto actorIt = state.players.find(packet.announcerActorPlayerId);
+                    if (actorIt != state.players.end() && !actorIt->second.name.empty()) {
+                        actorName = actorIt->second.name;
+                    }
+                    state.serverAnnouncementText = actorName + " " + eventLabel;
+                    state.serverAnnouncementUntil = arena::secondsNow() + 2.6;
+                }
+            }
+
+            uint8_t localTeam = state.localTeamId;
+            const auto localIt = state.players.find(state.localPlayerId);
+            if (localIt != state.players.end()) {
+                localTeam = localIt->second.teamId;
+            }
+            if (localTeam != 0 && previousHillOwnerTeam != state.hillOwnerTeam) {
+                if (state.hillOwnerTeam == localTeam) {
+                    if (state.audioReady && state.announcerWeCapturedLoaded) {
+                        PlaySound(state.announcerWeCaptured);
+                    }
+                } else if (previousHillOwnerTeam == localTeam && state.hillOwnerTeam != 0) {
+                    if (state.audioReady && state.announcerWeLostLoaded) {
+                        PlaySound(state.announcerWeLost);
+                    }
+                }
+            }
         }
     }
 }
@@ -2343,7 +2588,7 @@ void drawKothTestMapGeometry(const ClientState& state) {
     }
 }
 
-void drawRoom(const ClientState& state) {
+void drawRoom(ClientState& state) {
     constexpr float half = arena::RoomHalfSize;
     constexpr float height = arena::RoomHeight;
     constexpr float thickness = 0.2f;
@@ -2503,15 +2748,7 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
     EnemyClipAsset* renderClip = nullptr;
     EnemyAnimClip renderClipType = desiredClip;
     auto clipLooksDrawable = [](const EnemyClipAsset& c) {
-        if (!c.modelLoaded || c.model.meshCount <= 0 || c.model.meshes == nullptr) {
-            return false;
-        }
-        const BoundingBox b = getModelBounds(c.model);
-        const float sx = b.max.x - b.min.x;
-        const float sy = b.max.y - b.min.y;
-        const float sz = b.max.z - b.min.z;
-        return std::isfinite(sx) && std::isfinite(sy) && std::isfinite(sz) &&
-            sx > 0.00001f && sy > 0.00001f && sz > 0.00001f;
+        return c.modelLoaded && c.model.meshCount > 0 && c.model.meshes != nullptr;
     };
     auto clipHasPlayableAnim = [](const EnemyClipAsset& c) {
         return c.modelLoaded && c.animValidForModel && c.anims != nullptr && c.animCount > 0;
@@ -2580,6 +2817,8 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
             animState.pendingClip = renderClipType;
             animState.pendingClipTime = 0.0f;
             animState.frame = 0.0f;
+            animState.animUpdateAccumulator = 0.0f;
+            animState.lastAppliedAnimFrame = -1;
         } else {
             usePlayableClip(animState.activeClip);
             if (renderClipType != animState.activeClip) {
@@ -2587,6 +2826,8 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
                 animState.pendingClip = renderClipType;
                 animState.pendingClipTime = 0.0f;
                 animState.frame = 0.0f;
+                animState.animUpdateAccumulator = 0.0f;
+                animState.lastAppliedAnimFrame = -1;
             }
         }
     } else {
@@ -2605,20 +2846,26 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
     if (kEnableRemoteEnemyAnimation && renderClip->anims != nullptr && renderClip->animCount > 0 && renderClip->animValidForModel) {
         ModelAnimation& anim = renderClip->anims[0];
         const float fps = (renderClip->animFps > 0.0f) ? renderClip->animFps : firstAnimFpsOrDefault(renderClip->anims, renderClip->animCount);
-        animState.frame += fps * dt;
         if (anim.frameCount > 0) {
-            while (animState.frame >= static_cast<float>(anim.frameCount)) {
-                animState.frame -= static_cast<float>(anim.frameCount);
+            constexpr float kRemoteAnimTickHz = 24.0f;
+            constexpr float kRemoteAnimStep = 1.0f / kRemoteAnimTickHz;
+            animState.animUpdateAccumulator += std::max(0.0f, dt);
+            bool advanced = false;
+            while (animState.animUpdateAccumulator >= kRemoteAnimStep) {
+                animState.frame += fps * kRemoteAnimStep;
+                while (animState.frame >= static_cast<float>(anim.frameCount)) {
+                    animState.frame -= static_cast<float>(anim.frameCount);
+                }
+                animState.animUpdateAccumulator -= kRemoteAnimStep;
+                advanced = true;
             }
             const int frame = std::clamp(static_cast<int>(animState.frame), 0, anim.frameCount - 1);
-            UpdateModelAnimation(renderClip->model, anim, frame);
+            if (advanced && frame != animState.lastAppliedAnimFrame) {
+                UpdateModelAnimation(renderClip->model, anim, frame);
+                animState.lastAppliedAnimFrame = frame;
+            }
         }
     }
-
-    const BoundingBox dbgBounds = getModelBounds(renderClip->model);
-    const float dbgSizeX = dbgBounds.max.x - dbgBounds.min.x;
-    const float dbgSizeY = dbgBounds.max.y - dbgBounds.min.y;
-    const float dbgSizeZ = dbgBounds.max.z - dbgBounds.min.z;
 
     const float scaleY = renderClip->modelScale;
     const float scaleXZ = scaleY;
@@ -2636,21 +2883,27 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
         finishAnimSample();
         return;
     }
-    state.enemyModelDebug = "enemy model debug: mesh=" + std::to_string(renderClip->model.meshCount) +
-        " vtx=" + std::to_string((renderClip->model.meshCount > 0) ? renderClip->model.meshes[0].vertexCount : 0) +
-        " tri=" + std::to_string((renderClip->model.meshCount > 0) ? renderClip->model.meshes[0].triangleCount : 0) +
-        " sx=" + std::to_string(dbgSizeX) +
-        " sy=" + std::to_string(dbgSizeY) +
-        " sz=" + std::to_string(dbgSizeZ) +
-        " sXZ=" + std::to_string(scaleXZ) +
-        " sY=" + std::to_string(scaleY) +
-        " minY=" + std::to_string(renderClip->modelMinY) +
-        " drawY=" + std::to_string(drawPos.y) +
-        " yaw=" + std::to_string(totalYawDeg) +
-        " frame=" + std::to_string(animState.frame) +
-        " anim=" + std::string(kEnableRemoteEnemyAnimation ? "on" : "off") +
-        " clip=" + std::to_string(static_cast<int>(renderClipType)) +
-        " src=" + renderClip->sourcePath;
+    if (ShowBottomDebugOverlay) {
+        const BoundingBox dbgBounds = getModelBounds(renderClip->model);
+        const float dbgSizeX = dbgBounds.max.x - dbgBounds.min.x;
+        const float dbgSizeY = dbgBounds.max.y - dbgBounds.min.y;
+        const float dbgSizeZ = dbgBounds.max.z - dbgBounds.min.z;
+        state.enemyModelDebug = "enemy model debug: mesh=" + std::to_string(renderClip->model.meshCount) +
+            " vtx=" + std::to_string((renderClip->model.meshCount > 0) ? renderClip->model.meshes[0].vertexCount : 0) +
+            " tri=" + std::to_string((renderClip->model.meshCount > 0) ? renderClip->model.meshes[0].triangleCount : 0) +
+            " sx=" + std::to_string(dbgSizeX) +
+            " sy=" + std::to_string(dbgSizeY) +
+            " sz=" + std::to_string(dbgSizeZ) +
+            " sXZ=" + std::to_string(scaleXZ) +
+            " sY=" + std::to_string(scaleY) +
+            " minY=" + std::to_string(renderClip->modelMinY) +
+            " drawY=" + std::to_string(drawPos.y) +
+            " yaw=" + std::to_string(totalYawDeg) +
+            " frame=" + std::to_string(animState.frame) +
+            " anim=" + std::string(kEnableRemoteEnemyAnimation ? "on" : "off") +
+            " clip=" + std::to_string(static_cast<int>(renderClipType)) +
+            " src=" + renderClip->sourcePath;
+    }
     const Vector3 eulerDeg{0.0f, totalYawDeg, 0.0f};
     drawModelEuler(
         renderClip->model,
@@ -3334,6 +3587,14 @@ void render(ClientState& state, double now) {
     DrawRectangle(topX - 18, 10, topW + 36, 42, Color{10, 15, 24, 205});
     DrawRectangleLines(topX - 18, 10, topW + 36, 42, Color{190, 204, 224, 220});
     DrawText(topHud.c_str(), topX, 18, 30, Color{255, 241, 206, 255});
+    if (!state.serverAnnouncementText.empty() && arena::secondsNow() < state.serverAnnouncementUntil) {
+        const int fontSize = 34;
+        const int textW = MeasureText(state.serverAnnouncementText.c_str(), fontSize);
+        const int x = (GetScreenWidth() - textW) / 2;
+        const int y = 64;
+        DrawText(state.serverAnnouncementText.c_str(), x + 2, y + 2, fontSize, Color{0, 0, 0, 180});
+        DrawText(state.serverAnnouncementText.c_str(), x, y, fontSize, Color{255, 220, 140, 255});
+    }
     std::string weaponLabel = "Shotgun";
     if (state.equippedWeapon == WeaponSlot::Knife) weaponLabel = "Karambit";
     if (state.equippedWeapon == WeaponSlot::LightningGun) weaponLabel = "Lightning Gun";
@@ -3355,13 +3616,13 @@ void render(ClientState& state, double now) {
         hillText = "Hill: OVERTIME";
     } else if (state.hillContested != 0) {
         hillText = "Hill: Contested";
+    } else if (state.hillCaptureTeam != 0) {
+        hillText = "Hill: Team " + std::to_string(state.hillCaptureTeam) + " capturing " +
+            std::to_string(static_cast<int>(state.hillCaptureProgress * 100.0f)) + "%";
     } else if (state.hillOwnerTeam == 1) {
         hillText = "Hill: Owned by Team 1";
     } else if (state.hillOwnerTeam == 2) {
         hillText = "Hill: Owned by Team 2";
-    } else if (state.hillCaptureTeam != 0) {
-        hillText = "Hill: Team " + std::to_string(state.hillCaptureTeam) + " capturing " +
-            std::to_string(static_cast<int>(state.hillCaptureProgress * 100.0f)) + "%";
     }
     DrawText(hillText.c_str(), 16, 146, 20, Color{245, 235, 170, 255});
     if (state.matchWinnerTeam != 0) {
@@ -3420,11 +3681,12 @@ int main(int argc, char** argv) {
         }
         arena::makeNonBlocking(state.socket);
 
-        SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_FULLSCREEN_MODE);
+        SetConfigFlags(FLAG_MSAA_4X_HINT);
         InitWindow(WindowWidth, WindowHeight, "KOTH");
         SetExitKey(KEY_NULL);
         EnableCursor();
         state.mainMenuOpenedAt = GetTime();
+        applyDisplayMode(state, state.displayMode);
         initAssets(state);
 
         double nextHelloAt = 0.0;
@@ -3432,6 +3694,13 @@ int main(int argc, char** argv) {
         std::cout << "Connecting to " << host << ":" << port << "\n";
 
         while (!WindowShouldClose()) {
+            if (IsKeyPressed(KEY_ENTER) && (keyDown(KEY_LEFT_ALT) || keyDown(KEY_RIGHT_ALT))) {
+                const DisplayMode nextMode = (state.displayMode == DisplayMode::Fullscreen)
+                    ? DisplayMode::Borderless
+                    : DisplayMode::Fullscreen;
+                applyDisplayMode(state, nextMode);
+            }
+
             if (state.screenMode == ScreenMode::MainMenu) {
                 if (IsCursorHidden()) {
                     EnableCursor();
@@ -3454,6 +3723,7 @@ int main(int argc, char** argv) {
 
             const float wheelMove = GetMouseWheelMove();
             const double inputNow = arena::secondsNow();
+            const bool ctrlHeld = keyDown(KEY_LEFT_CONTROL) || keyDown(KEY_RIGHT_CONTROL);
             const bool airborne = state.localPosition.y > 0.05f;
             constexpr double dashTapWindow = 0.25;
             auto tryQueueDash = [&](double& lastAt, int8_t mx, int8_t mz) {
@@ -3483,13 +3753,13 @@ int main(int argc, char** argv) {
             if (wheelMove > 0.0f) {
                 state.wheelForwardTicks = std::max(state.wheelForwardTicks, 2);
             }
-            if (IsKeyPressed(KEY_ONE)) {
+            if (!ctrlHeld && IsKeyPressed(KEY_ONE)) {
                 equipWeapon(state, WeaponSlot::Shotgun, arena::secondsNow());
             }
-            if (IsKeyPressed(KEY_TWO)) {
+            if (!ctrlHeld && IsKeyPressed(KEY_TWO)) {
                 equipWeapon(state, WeaponSlot::LightningGun, arena::secondsNow());
             }
-            if (IsKeyPressed(KEY_THREE)) {
+            if (!ctrlHeld && IsKeyPressed(KEY_THREE)) {
                 equipWeapon(state, WeaponSlot::Knife, arena::secondsNow());
             }
             if (IsKeyPressed(KEY_Q)) {

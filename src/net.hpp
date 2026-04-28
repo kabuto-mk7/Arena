@@ -50,6 +50,23 @@ enum class PacketType : uint8_t {
     MapData = 5,
 };
 
+enum class AnnouncerEvent : uint8_t {
+    None = 0,
+    DoubleKill = 1,
+    TripleKill = 2,
+    QuadKill = 3,
+    PentaKill = 4,
+    Godlike = 5,
+    Overtime = 6,
+    Victory = 7,
+    Defeat = 8,
+    CountOne = 9,
+    CountTwo = 10,
+    CountThree = 11,
+    CountFour = 12,
+    CountFive = 13,
+};
+
 #pragma pack(push, 1)
 struct PacketHeader {
     uint32_t magic;
@@ -141,6 +158,9 @@ struct SnapshotPacket {
     uint8_t matchWinnerTeam;
     uint16_t matchResetSecondsLeft;
     float hillCaptureProgress;
+    uint32_t announcerSeq;
+    uint8_t announcerEvent;
+    uint32_t announcerActorPlayerId;
     PlayerStatePacket players[MaxPlayers];
 };
 #pragma pack(pop)
