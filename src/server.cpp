@@ -20,7 +20,7 @@ enum class WeaponSlot : uint8_t {
 
 constexpr float BaseMoveSpeed = 8.9f;
 constexpr float KnifeSpeedMultiplier = 1.2f;
-constexpr float KnifeJumpMultiplier = 1.08f;
+constexpr float KnifeJumpMultiplier = 1.03f;
 constexpr float SvAccelerate = 12.0f;
 constexpr float SvAirAccelerate = 5.0f;
 constexpr float SvFriction = 7.0f;
@@ -31,11 +31,11 @@ constexpr float AirDashImpulse = 18.5f;
 constexpr float AirDashMaxSpeed = 26.0f;
 constexpr float AirDashBoostDuration = 0.075f;
 constexpr float AirDashBoostSpeedFactor = 2.2f;
-constexpr float GravityScale = 1.18f;
-constexpr float JumpVelocityScale = 0.9f;
+constexpr float GravityScale = 1.36f;
+constexpr float JumpVelocityScale = 0.82f;
 constexpr float JumpStrafeAssist = 1.2f;
 constexpr float JumpBufferSeconds = 0.18f;
-constexpr int MaxHealth = 10000;
+constexpr int MaxHealth = 100;
 constexpr float ShotgunRange = 36.0f;
 constexpr int ShotgunDamage = 34;
 constexpr float ShotgunFireInterval = 0.24f;
@@ -46,6 +46,10 @@ constexpr float LightningGunRange = 46.0f;
 constexpr int LightningGunDamagePerTick = 7;
 constexpr float LightningGunTickInterval = 0.05f;
 constexpr float RespawnDelaySeconds = 3.0f;
+constexpr float HillRoundTimeSeconds = 180.0f;
+constexpr uint8_t MatchPointTarget = 3;
+constexpr double RoundIntermissionSeconds = 2.5;
+constexpr double MatchVictoryScreenSeconds = 6.0;
 
 struct StaticSolid {
     arena::Vec3 center{};
@@ -282,17 +286,86 @@ struct Player {
 struct HillState {
     arena::Vec3 center{0.0f, 0.0f, 0.0f};
     float radius = 8.0f;
-    float team1TimeLeft = 180.0f;
-    float team2TimeLeft = 180.0f;
+    float team1TimeLeft = HillRoundTimeSeconds;
+    float team2TimeLeft = HillRoundTimeSeconds;
     uint8_t ownerTeam = 0;
     uint8_t captureTeam = 0;
     uint8_t contested = 0;
     uint8_t overtime = 0;
     uint8_t winnerTeam = 0;
     uint8_t overtimeCheckTeam = 0;
+    uint8_t team1RoundPoints = 0;
+    uint8_t team2RoundPoints = 0;
+    uint8_t matchWinnerTeam = 0;
     float captureProgress = 0.0f;
+    double roundResetAt = 0.0;
+    double matchResetAt = 0.0;
     double lastUpdateAt = 0.0;
 };
+
+void spawnPlayerOnTeam(Player& player, int teamSlot) {
+    if (player.teamId == 1) {
+        const float z = -12.0f + static_cast<float>(teamSlot) * 4.0f;
+        player.position = {-16.0f, 0.0f, z};
+    } else {
+        const float z = -12.0f + static_cast<float>(teamSlot) * 4.0f;
+        player.position = {16.0f, 0.0f, z};
+    }
+}
+
+void resetPlayerForSpawn(Player& player, double now, int teamSlot) {
+    player.dead = false;
+    player.health = MaxHealth;
+    player.velocity = {};
+    player.velocityY = 0.0f;
+    player.nextFireAt = now + 0.2;
+    player.wasForwardHeld = false;
+    player.airborneSpeedMultiplier = 1.0f;
+    player.jumpedSinceGround = false;
+    player.airDashCharges = 0;
+    player.dashBoostUntil = 0.0;
+    player.lgBeamUntil = 0.0;
+    player.lgBeamEnd = {};
+    player.grounded = true;
+    player.crouched = false;
+    player.respawnAt = 0.0;
+    spawnPlayerOnTeam(player, teamSlot);
+}
+
+void resetAllPlayersForNewRound(std::vector<Player>& players, double now) {
+    int team1Slot = 0;
+    int team2Slot = 0;
+    for (Player& player : players) {
+        if (player.teamId == 1) {
+            resetPlayerForSpawn(player, now, team1Slot++);
+        } else {
+            resetPlayerForSpawn(player, now, team2Slot++);
+        }
+    }
+}
+
+void resetHillForNewRound(HillState& hill, double now) {
+    hill.team1TimeLeft = HillRoundTimeSeconds;
+    hill.team2TimeLeft = HillRoundTimeSeconds;
+    hill.ownerTeam = 0;
+    hill.captureTeam = 0;
+    hill.contested = 0;
+    hill.overtime = 0;
+    hill.winnerTeam = 0;
+    hill.overtimeCheckTeam = 0;
+    hill.captureProgress = 0.0f;
+    hill.roundResetAt = 0.0;
+    hill.lastUpdateAt = now;
+}
+
+void resetMatchState(HillState& hill, std::vector<Player>& players, double now) {
+    hill.team1RoundPoints = 0;
+    hill.team2RoundPoints = 0;
+    hill.matchWinnerTeam = 0;
+    hill.matchResetAt = 0.0;
+    resetHillForNewRound(hill, now);
+    resetAllPlayersForNewRound(players, now);
+}
 
 float horizontalSpeed(const arena::Vec3& v) {
     return std::sqrt(v.x * v.x + v.z * v.z);
@@ -824,12 +897,6 @@ bool processCombatInput(Player& attacker, std::vector<Player>& players, const ar
 }
 
 void processRespawns(std::vector<Player>& players, double now) {
-    int team1Count = 0;
-    int team2Count = 0;
-    for (const Player& p : players) {
-        if (p.teamId == 1) team1Count++;
-        if (p.teamId == 2) team2Count++;
-    }
     int team1SpawnIndex = 0;
     int team2SpawnIndex = 0;
 
@@ -837,28 +904,10 @@ void processRespawns(std::vector<Player>& players, double now) {
         if (!player.dead || now < player.respawnAt) {
             continue;
         }
-        player.dead = false;
-        player.health = MaxHealth;
-        player.velocity = {};
-        player.velocityY = 0.0f;
-        player.nextFireAt = now + 0.2;
-        player.wasForwardHeld = false;
-        player.airborneSpeedMultiplier = 1.0f;
-        player.jumpedSinceGround = false;
-        player.airDashCharges = 0;
-        player.dashBoostUntil = 0.0;
-        player.lgBeamUntil = 0.0;
-        player.lgBeamEnd = {};
-        player.grounded = true;
-
         if (player.teamId == 1) {
-            const float z = -12.0f + static_cast<float>(team1SpawnIndex % std::max(1, team1Count)) * 4.0f;
-            player.position = {-16.0f, 0.0f, z};
-            team1SpawnIndex++;
+            resetPlayerForSpawn(player, now, team1SpawnIndex++);
         } else {
-            const float z = -12.0f + static_cast<float>(team2SpawnIndex % std::max(1, team2Count)) * 4.0f;
-            player.position = {16.0f, 0.0f, z};
-            team2SpawnIndex++;
+            resetPlayerForSpawn(player, now, team2SpawnIndex++);
         }
     }
 }
@@ -869,7 +918,7 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
     }
     const float frameDt = static_cast<float>(std::max(0.0, now - hill.lastUpdateAt));
     hill.lastUpdateAt = now;
-    if (hill.winnerTeam != 0) {
+    if (hill.matchWinnerTeam != 0 || hill.winnerTeam != 0) {
         return;
     }
 
@@ -903,13 +952,14 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
     }
 
     constexpr float captureTimeSeconds = 8.0f;
-    const float delta = arena::TickSeconds / captureTimeSeconds;
+    const float captureStep = (frameDt > 0.0f) ? (frameDt / captureTimeSeconds) : 0.0f;
+    const float neutralDecayStep = captureStep * 0.5f;
 
     if (hill.contested != 0) {
         // Contested point: freeze progress exactly where it is.
     } else if (capturingTeam == 0) {
         if (hill.ownerTeam == 0 && hill.captureProgress > 0.0f) {
-            hill.captureProgress = std::max(0.0f, hill.captureProgress - delta * 0.5f);
+            hill.captureProgress = std::max(0.0f, hill.captureProgress - neutralDecayStep);
             if (hill.captureProgress == 0.0f) {
                 hill.captureTeam = 0;
             }
@@ -917,14 +967,16 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
     } else if (hill.ownerTeam == capturingTeam) {
         hill.captureTeam = capturingTeam;
         hill.captureProgress = 1.0f;
-    } else if (hill.ownerTeam != 0 && hill.ownerTeam != capturingTeam) {
-        // Enemy is taking an owned point: first neutralize, then roll directly into recapture.
-        hill.captureTeam = capturingTeam;
-        hill.captureProgress -= delta;
-        if (hill.captureProgress <= 0.0f) {
-            const float overflow = -hill.captureProgress;
-            hill.ownerTeam = 0;
-            hill.captureProgress = std::min(1.0f, overflow);
+    } else if (hill.ownerTeam == 0) {
+        if (hill.captureTeam != 0 && hill.captureTeam != capturingTeam) {
+            // Neutral point with opposite team progress: burn down first.
+            hill.captureProgress = std::max(0.0f, hill.captureProgress - captureStep);
+            if (hill.captureProgress == 0.0f) {
+                hill.captureTeam = capturingTeam;
+            }
+        } else {
+            hill.captureTeam = capturingTeam;
+            hill.captureProgress = std::min(1.0f, hill.captureProgress + captureStep);
             if (hill.captureProgress >= 1.0f) {
                 hill.ownerTeam = capturingTeam;
                 hill.captureTeam = capturingTeam;
@@ -932,20 +984,18 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
             }
         }
     } else {
-        if (hill.captureTeam != capturingTeam) {
-            hill.captureTeam = capturingTeam;
+        // Enemy on owned point: neutralize to 0 first, then begin capture on following ticks.
+        hill.captureTeam = capturingTeam;
+        hill.captureProgress = std::max(0.0f, hill.captureProgress - captureStep);
+        if (hill.captureProgress <= 0.0f) {
+            hill.ownerTeam = 0;
             hill.captureProgress = 0.0f;
-        }
-        hill.captureProgress = std::min(1.0f, hill.captureProgress + delta);
-        if (hill.captureProgress >= 1.0f) {
-            hill.ownerTeam = capturingTeam;
-            hill.captureTeam = capturingTeam;
-            hill.captureProgress = 1.0f;
         }
     }
 
-    // TF2-style KOTH timer: owning team clock counts down.
-    if (hill.overtime == 0 && hill.contested == 0 && hill.ownerTeam != 0 && frameDt > 0.0f) {
+    // TF2-style KOTH timer: owning team clock counts down as long as they still own the point,
+    // even when enemies are contesting.
+    if (hill.overtime == 0 && hill.ownerTeam != 0 && frameDt > 0.0f) {
         if (hill.ownerTeam == 1) {
             hill.team1TimeLeft = std::max(0.0f, hill.team1TimeLeft - frameDt);
         } else if (hill.ownerTeam == 2) {
@@ -960,8 +1010,9 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
         if (hill.team2TimeLeft <= 0.0f) zeroTeam = 2;
         if (zeroTeam != 0) {
             const uint8_t otherTeam = (zeroTeam == 1) ? 2 : 1;
-            const bool otherCapturing = (hill.captureTeam == otherTeam && hill.captureProgress > 0.0f && hill.ownerTeam != otherTeam);
-            if (otherCapturing) {
+            const bool zeroTeamOwnsPoint = (hill.ownerTeam == zeroTeam);
+            const bool enemyPressuringPoint = (zeroTeam == 1) ? (team2OnHill > 0) : (team1OnHill > 0);
+            if (zeroTeamOwnsPoint && enemyPressuringPoint) {
                 hill.overtime = 1;
                 hill.overtimeCheckTeam = zeroTeam;
             } else {
@@ -970,18 +1021,52 @@ void updateHillState(HillState& hill, const std::vector<Player>& players, double
         }
     } else {
         // Overtime resolution:
-        // - Team at 0 wins if enemy capture progress is fully cleared.
+        // - Team at 0 wins once enemy pressure ends without a completed takeover.
         // - Enemy wins if they successfully overtake point.
         const uint8_t checkTeam = hill.overtimeCheckTeam;
         const uint8_t otherTeam = (checkTeam == 1) ? 2 : 1;
-        const bool otherCapturing = (hill.captureTeam == otherTeam && hill.captureProgress > 0.0f && hill.ownerTeam != otherTeam);
-        if (!otherCapturing && hill.ownerTeam == checkTeam) {
-            hill.winnerTeam = checkTeam;
-            hill.overtime = 0;
-        } else if (hill.ownerTeam == otherTeam) {
+        const bool enemyStillPressuring = (checkTeam == 1) ? (team2OnHill > 0) : (team1OnHill > 0);
+        if (hill.ownerTeam == otherTeam) {
             hill.winnerTeam = otherTeam;
             hill.overtime = 0;
+        } else if (!enemyStillPressuring) {
+            hill.winnerTeam = checkTeam;
+            hill.overtime = 0;
         }
+    }
+}
+
+void updateRoundAndMatchFlow(HillState& hill, std::vector<Player>& players, double now) {
+    if (hill.matchWinnerTeam != 0) {
+        if (hill.matchResetAt > 0.0 && now >= hill.matchResetAt) {
+            resetMatchState(hill, players, now);
+        }
+        return;
+    }
+
+    if (hill.winnerTeam == 0) {
+        return;
+    }
+
+    if (hill.roundResetAt <= 0.0) {
+        if (hill.winnerTeam == 1) {
+            hill.team1RoundPoints = static_cast<uint8_t>(std::min<int>(255, hill.team1RoundPoints + 1));
+        } else if (hill.winnerTeam == 2) {
+            hill.team2RoundPoints = static_cast<uint8_t>(std::min<int>(255, hill.team2RoundPoints + 1));
+        }
+
+        if (hill.team1RoundPoints >= MatchPointTarget || hill.team2RoundPoints >= MatchPointTarget) {
+            hill.matchWinnerTeam = (hill.team1RoundPoints >= MatchPointTarget) ? 1 : 2;
+            hill.matchResetAt = now + MatchVictoryScreenSeconds;
+            return;
+        }
+
+        hill.roundResetAt = now + RoundIntermissionSeconds;
+    }
+
+    if (now >= hill.roundResetAt) {
+        resetHillForNewRound(hill, now);
+        resetAllPlayersForNewRound(players, now);
     }
 }
 
@@ -997,6 +1082,16 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
     packet.hillContested = hill.contested;
     packet.hillOvertime = hill.overtime;
     packet.hillWinnerTeam = hill.winnerTeam;
+    packet.team1RoundPoints = hill.team1RoundPoints;
+    packet.team2RoundPoints = hill.team2RoundPoints;
+    packet.matchWinnerTeam = hill.matchWinnerTeam;
+    const double now = arena::secondsNow();
+    if (hill.matchWinnerTeam != 0 && hill.matchResetAt > now) {
+        packet.matchResetSecondsLeft = static_cast<uint16_t>(
+            std::clamp(static_cast<int>(std::ceil(hill.matchResetAt - now)), 0, 65535));
+    } else {
+        packet.matchResetSecondsLeft = 0;
+    }
     packet.hillCaptureProgress = hill.captureProgress;
 
     const double snapshotNow = arena::secondsNow();
@@ -1007,6 +1102,9 @@ void broadcastSnapshot(SOCKET socket, const std::vector<Player>& players, uint32
         packet.players[i].x = players[i].position.x;
         packet.players[i].y = players[i].position.y;
         packet.players[i].z = players[i].position.z;
+        packet.players[i].vx = players[i].velocity.x;
+        packet.players[i].vy = players[i].velocity.y;
+        packet.players[i].vz = players[i].velocity.z;
         packet.players[i].yaw = players[i].yaw;
         packet.players[i].pitch = players[i].pitch;
         packet.players[i].crouched = players[i].crouched ? 1 : 0;
@@ -1108,11 +1206,13 @@ int main(int argc, char** argv) {
                         Player player{};
                         player.id = nextPlayerId++;
                         player.address = from;
-                        player.position = {static_cast<float>((player.id % 8) * 2), 0.0f, 0.0f};
                         player.teamId = (players.size() % 2 == 0) ? 1 : 2;
                         player.health = MaxHealth;
                         player.lastHeardAt = arena::secondsNow();
                         player.name = uniqueJoinName(players, std::string(hello.desiredName));
+                        const int teamSlot = static_cast<int>(std::count_if(
+                            players.begin(), players.end(), [&](const Player& p) { return p.teamId == player.teamId; }));
+                        resetPlayerForSpawn(player, player.lastHeardAt, teamSlot);
                         players.push_back(player);
                         existing = &players.back();
                         std::cout << "Player " << existing->id << " (" << existing->name << ") joined from " << arena::addressToString(from)
@@ -1159,6 +1259,7 @@ int main(int argc, char** argv) {
 
                 processRespawns(players, now);
                 updateHillState(hill, players, now);
+                updateRoundAndMatchFlow(hill, players, now);
                 broadcastSnapshot(socket, players, serverTick++, hill);
                 nextTickAt += arena::TickSeconds;
             }

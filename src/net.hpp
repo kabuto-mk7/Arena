@@ -101,6 +101,9 @@ struct PlayerStatePacket {
     float x;
     float y;
     float z;
+    float vx;
+    float vy;
+    float vz;
     float yaw;
     float pitch;
     uint8_t crouched;
@@ -133,6 +136,10 @@ struct SnapshotPacket {
     uint8_t hillContested;
     uint8_t hillOvertime;
     uint8_t hillWinnerTeam;
+    uint8_t team1RoundPoints;
+    uint8_t team2RoundPoints;
+    uint8_t matchWinnerTeam;
+    uint16_t matchResetSecondsLeft;
     float hillCaptureProgress;
     PlayerStatePacket players[MaxPlayers];
 };

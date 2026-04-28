@@ -27,8 +27,13 @@
 
 namespace {
 
-constexpr int WindowWidth = 1280;
-constexpr int WindowHeight = 720;
+constexpr int WindowWidth = 1920;
+constexpr int WindowHeight = 1080;
+#if defined(NDEBUG)
+constexpr bool ShowBottomDebugOverlay = false;
+#else
+constexpr bool ShowBottomDebugOverlay = true;
+#endif
 constexpr float DefaultMouseSensitivity = 0.0005f;
 constexpr float StepIntervalWalk = 0.37f;
 constexpr float StepIntervalCrouch = 0.52f;
@@ -76,6 +81,7 @@ enum class ScreenMode {
 struct RemotePlayer {
     std::string name = "Player";
     arena::Vec3 position{};
+    arena::Vec3 velocity{};
     float yaw = 0.0f;
     float pitch = 0.0f;
     bool crouched = false;
@@ -113,6 +119,10 @@ struct EnemyAnimState {
     float estimatedSpeed = 0.0f;
     float smoothedSpeed = 0.0f;
     arena::Vec3 smoothedVelocity{};
+    uint8_t lastHealth = 100;
+    bool hasLastHealth = false;
+    float hitReactTimeRemaining = 0.0f;
+    bool hitReactRestartRequested = false;
     bool wasAirborne = false;
     EnemyAnimClip activeClip = EnemyAnimClip::Idle;
     EnemyAnimClip pendingClip = EnemyAnimClip::Idle;
@@ -274,6 +284,12 @@ struct DamagePopup {
     float lifetime = 0.85f;
 };
 
+struct KillFeedEntry {
+    std::string text{};
+    float age = 0.0f;
+    float lifetime = 2.0f;
+};
+
 struct ClientState {
     SOCKET socket = INVALID_SOCKET;
     sockaddr_in serverAddress{};
@@ -375,6 +391,8 @@ struct ClientState {
     uint8_t localHealth = 100;
     uint16_t localHitConfirmCount = 0;
     bool localHitConfirmInitialized = false;
+    uint16_t localKillCount = 0;
+    bool localKillCountInitialized = false;
     bool localDead = false;
     float weaponBobPhase = 0.0f;
     float recoilOffset = 0.0f;
@@ -395,9 +413,16 @@ struct ClientState {
     uint8_t hillContested = 0;
     uint8_t hillOvertime = 0;
     uint8_t hillWinnerTeam = 0;
+    uint8_t team1RoundPoints = 0;
+    uint8_t team2RoundPoints = 0;
+    uint8_t matchWinnerTeam = 0;
+    uint16_t matchResetSecondsLeft = 0;
     float hillCaptureProgress = 0.0f;
+    float smoothedPingMs = 0.0f;
+    bool smoothedPingInitialized = false;
     std::vector<AmmoPack> ammoPacks;
     std::vector<DamagePopup> damagePopups;
+    std::vector<KillFeedEntry> killFeed;
     std::map<uint32_t, uint8_t> enemyPrevFiring;
     std::map<uint32_t, double> enemyNextFireSoundAt;
     std::map<uint32_t, EnemyAnimState> enemyAnimStateById;
@@ -2050,6 +2075,7 @@ void pumpNetwork(ClientState& state) {
                 RemotePlayer player{};
                 player.name = std::string(packet.players[i].name);
                 player.position = {packet.players[i].x, packet.players[i].y, packet.players[i].z};
+                player.velocity = {packet.players[i].vx, packet.players[i].vy, packet.players[i].vz};
                 player.yaw = packet.players[i].yaw;
                 player.pitch = packet.players[i].pitch;
                 player.crouched = packet.players[i].crouched != 0;
@@ -2113,6 +2139,10 @@ void pumpNetwork(ClientState& state) {
             state.hillContested = packet.hillContested;
             state.hillOvertime = packet.hillOvertime;
             state.hillWinnerTeam = packet.hillWinnerTeam;
+            state.team1RoundPoints = packet.team1RoundPoints;
+            state.team2RoundPoints = packet.team2RoundPoints;
+            state.matchWinnerTeam = packet.matchWinnerTeam;
+            state.matchResetSecondsLeft = packet.matchResetSecondsLeft;
             state.hillCaptureProgress = packet.hillCaptureProgress;
         }
     }
@@ -2127,6 +2157,13 @@ void syncLocalPosition(ClientState& state) {
         state.localTeamId = it->second.teamId;
         state.localHealth = it->second.health;
         state.localDead = it->second.dead;
+        const float latestPingMs = static_cast<float>(it->second.pingMs);
+        if (!state.smoothedPingInitialized) {
+            state.smoothedPingMs = latestPingMs;
+            state.smoothedPingInitialized = true;
+        } else {
+            state.smoothedPingMs += (latestPingMs - state.smoothedPingMs) * 0.18f;
+        }
         if (state.localHealth < previousHealth) {
             state.damageFlash = 1.0f;
         }
@@ -2149,8 +2186,25 @@ void syncLocalPosition(ClientState& state) {
                 state.damagePopups.push_back(popup);
             }
         }
+        if (state.localKillCountInitialized && it->second.kills != state.localKillCount) {
+            const uint16_t delta = static_cast<uint16_t>(it->second.kills - state.localKillCount);
+            int toAdd = std::min<int>(delta == 0 ? 0 : delta, 6);
+            while (toAdd-- > 0) {
+                KillFeedEntry entry{};
+                entry.lifetime = 2.2f;
+                const auto targetIt = state.players.find(it->second.lastHitTargetId);
+                if (targetIt != state.players.end() && !targetIt->second.name.empty()) {
+                    entry.text = "ELIMINATED " + targetIt->second.name;
+                } else {
+                    entry.text = "ELIMINATED ENEMY";
+                }
+                state.killFeed.push_back(entry);
+            }
+        }
         state.localHitConfirmCount = it->second.hitConfirmCount;
         state.localHitConfirmInitialized = true;
+        state.localKillCount = it->second.kills;
+        state.localKillCountInitialized = true;
         if (!state.smoothedRenderPositionInitialized) {
             state.smoothedRenderPosition = state.localPosition;
             state.smoothedRenderPositionInitialized = true;
@@ -2197,6 +2251,17 @@ void updateDamagePopups(ClientState& state, float dt) {
             return popup.age >= popup.lifetime;
         }),
         state.damagePopups.end());
+}
+
+void updateKillFeed(ClientState& state, float dt) {
+    for (KillFeedEntry& entry : state.killFeed) {
+        entry.age += dt;
+    }
+    state.killFeed.erase(
+        std::remove_if(state.killFeed.begin(), state.killFeed.end(), [](const KillFeedEntry& entry) {
+            return entry.age >= entry.lifetime;
+        }),
+        state.killFeed.end());
 }
 
 void drawTriangleBothSides(Vector3 a, Vector3 b, Vector3 c, Color color) {
@@ -2350,6 +2415,9 @@ EnemyAnimClip pickEnemyAnim(const RemotePlayer& player, EnemyAnimState& animStat
     if (player.dead) {
         return EnemyAnimClip::HitReact;
     }
+    if (animState.hitReactTimeRemaining > 0.0f) {
+        return EnemyAnimClip::HitReact;
+    }
     if (airborne) {
         return EnemyAnimClip::Jump; // Full jump clip used as airborne pose/sequence.
     }
@@ -2360,9 +2428,11 @@ EnemyAnimClip pickEnemyAnim(const RemotePlayer& player, EnemyAnimState& animStat
     const float cosYaw = std::cos(player.yaw);
     const arena::Vec3 forward{sinYaw, 0.0f, -cosYaw};
     const arena::Vec3 right{cosYaw, 0.0f, sinYaw};
-    const arena::Vec3 velocity = animState.hasLastPosition && dt > 0.0001f
-        ? (player.position - animState.lastPosition) * (1.0f / dt)
-        : arena::Vec3{};
+    arena::Vec3 velocity = player.velocity;
+    const float netVelSq = velocity.x * velocity.x + velocity.z * velocity.z;
+    if (netVelSq < 0.000001f && animState.hasLastPosition && dt > 0.0001f) {
+        velocity = (player.position - animState.lastPosition) * (1.0f / dt);
+    }
     const float rawSpeed = std::sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
     const float smoothT = animState.hasLastPosition ? std::clamp(dt * 12.0f, 0.0f, 1.0f) : 1.0f;
     animState.smoothedVelocity.x += (velocity.x - animState.smoothedVelocity.x) * smoothT;
@@ -2374,7 +2444,7 @@ EnemyAnimClip pickEnemyAnim(const RemotePlayer& player, EnemyAnimState& animStat
     animState.estimatedSpeed = animState.smoothedSpeed;
 
     const bool activeIdle = animState.activeClip == EnemyAnimClip::Idle;
-    const float idleThreshold = activeIdle ? 0.72f : 0.28f;
+    const float idleThreshold = activeIdle ? 0.35f : 0.18f;
     if (animState.smoothedSpeed < idleThreshold) {
         return EnemyAnimClip::Idle;
     }
@@ -2396,20 +2466,17 @@ EnemyAnimClip pickEnemyAnim(const RemotePlayer& player, EnemyAnimState& animStat
     const float moveRight = arena::dot(animState.smoothedVelocity, right);
     const float absForward = std::abs(moveForward);
     const float absRight = std::abs(moveRight);
-    const float directionalSpeed = std::max(0.001f, std::sqrt(absForward * absForward + absRight * absRight));
-    const float lateralShare = absRight / directionalSpeed;
-    const bool activeStrafe = animState.activeClip == EnemyAnimClip::StrafeLeft ||
-        animState.activeClip == EnemyAnimClip::StrafeRight;
-    if (absRight > (activeStrafe ? 0.25f : 0.35f) &&
-        lateralShare > (activeStrafe ? 0.34f : 0.42f)) {
+
+    // Deterministic directional mapping: dominant lateral motion is strafe,
+    // dominant negative forward motion is run backward, otherwise move forward.
+    if (absRight > absForward * 0.75f) {
         return moveRight > 0.0f ? EnemyAnimClip::StrafeRight : EnemyAnimClip::StrafeLeft;
     }
-    const bool activeBackward = animState.activeClip == EnemyAnimClip::RunBackward;
-    if (moveForward < -(activeBackward ? 0.30f : 0.42f) && absForward >= absRight * 0.85f) {
+    if (moveForward < -0.05f) {
         return EnemyAnimClip::RunBackward;
     }
     const bool activeRun = animState.activeClip == EnemyAnimClip::RunForward;
-    if (moveForward > -0.20f && animState.smoothedSpeed > (activeRun ? 4.1f : 5.0f)) {
+    if (animState.smoothedSpeed > (activeRun ? 3.8f : 4.6f)) {
         return EnemyAnimClip::RunForward;
     }
     return EnemyAnimClip::WalkForward;
@@ -2419,6 +2486,13 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
     sanitizeEnemyTune(state);
     EnemyAnimState& animState = state.enemyAnimStateById[playerId];
     const bool airborne = player.position.y > 0.08f;
+    animState.hitReactTimeRemaining = std::max(0.0f, animState.hitReactTimeRemaining - std::max(dt, 0.0f));
+    if (animState.hasLastHealth && !player.dead && player.health < animState.lastHealth) {
+        animState.hitReactTimeRemaining = 0.20f;
+        animState.hitReactRestartRequested = true;
+    }
+    animState.lastHealth = player.health;
+    animState.hasLastHealth = true;
     auto finishAnimSample = [&]() {
         animState.lastPosition = player.position;
         animState.hasLastPosition = true;
@@ -2443,15 +2517,53 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
         return c.modelLoaded && c.animValidForModel && c.anims != nullptr && c.animCount > 0;
     };
 
+    auto clipPlayable = [&](EnemyAnimClip clipType) {
+        const EnemyClipAsset& clip = state.enemyClipAssets[static_cast<size_t>(clipType)];
+        return clipLooksDrawable(clip) && clipHasPlayableAnim(clip);
+    };
+
     auto usePlayableClip = [&](EnemyAnimClip clipType) {
-        renderClipType = clipType;
-        renderClip = &state.enemyClipAssets[static_cast<size_t>(renderClipType)];
-        if (!clipLooksDrawable(*renderClip) || !clipHasPlayableAnim(*renderClip)) {
-            renderClipType = EnemyAnimClip::Idle;
-            renderClip = &state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
+        auto tryClip = [&](EnemyAnimClip candidate) {
+            if (!clipPlayable(candidate)) {
+                return false;
+            }
+            renderClipType = candidate;
+            renderClip = &state.enemyClipAssets[static_cast<size_t>(candidate)];
+            return true;
+        };
+
+        switch (clipType) {
+        case EnemyAnimClip::StrafeLeft:
+            if (tryClip(EnemyAnimClip::StrafeLeft) || tryClip(EnemyAnimClip::WalkForward) || tryClip(EnemyAnimClip::RunForward)) return;
+            break;
+        case EnemyAnimClip::StrafeRight:
+            if (tryClip(EnemyAnimClip::StrafeRight) || tryClip(EnemyAnimClip::WalkForward) || tryClip(EnemyAnimClip::RunForward)) return;
+            break;
+        case EnemyAnimClip::RunBackward:
+            if (tryClip(EnemyAnimClip::RunBackward) || tryClip(EnemyAnimClip::WalkForward) || tryClip(EnemyAnimClip::RunForward)) return;
+            break;
+        case EnemyAnimClip::RunForward:
+            if (tryClip(EnemyAnimClip::RunForward) || tryClip(EnemyAnimClip::WalkForward)) return;
+            break;
+        case EnemyAnimClip::WalkForward:
+            if (tryClip(EnemyAnimClip::WalkForward) || tryClip(EnemyAnimClip::RunForward)) return;
+            break;
+        default:
+            if (tryClip(clipType)) return;
+            break;
         }
+
+        renderClipType = EnemyAnimClip::Idle;
+        renderClip = &state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
     };
     usePlayableClip(desiredClip);
+    if (animState.hitReactRestartRequested && renderClipType == EnemyAnimClip::HitReact) {
+        animState.activeClip = EnemyAnimClip::HitReact;
+        animState.pendingClip = EnemyAnimClip::HitReact;
+        animState.pendingClipTime = 0.0f;
+        animState.frame = 0.0f;
+        animState.hitReactRestartRequested = false;
+    }
 
     if (renderClipType != animState.activeClip) {
         if (renderClipType != animState.pendingClip) {
@@ -2480,6 +2592,9 @@ void drawAnimatedRemotePlayer(ClientState& state, uint32_t playerId, const Remot
     } else {
         animState.pendingClip = renderClipType;
         animState.pendingClipTime = 0.0f;
+    }
+    if (renderClipType != EnemyAnimClip::HitReact) {
+        animState.hitReactRestartRequested = false;
     }
     if (!clipLooksDrawable(*renderClip)) {
         state.enemyModelDebug = "enemy model debug: idle model not loaded";
@@ -3144,6 +3259,9 @@ void render(ClientState& state, double now) {
         if (id == state.localPlayerId) {
             continue;
         }
+        if (player.dead) {
+            continue;
+        }
         if (PreviewIdleModelOnly) {
             continue;
         }
@@ -3181,41 +3299,36 @@ void render(ClientState& state, double now) {
     const float displaySpeedUnits = state.currentSpeed * 100.0f;
     DrawText(TextFormat("%.0f u/s", displaySpeedUnits), cx + 14, cy + 14, 20, Color{225, 232, 245, 255});
 
-    uint32_t team1Points = 0;
-    uint32_t team2Points = 0;
-    for (const auto& [id, p] : state.players) {
-        (void)id;
-        if (p.teamId == 1) team1Points += p.kills;
-        if (p.teamId == 2) team2Points += p.kills;
-    }
-    const std::string status = state.connected
-        ? "Connected as " + state.localPlayerName + " (#" + std::to_string(state.localPlayerId) + ") | players: " + std::to_string(state.players.size())
-        : "Connecting to server...";
-    DrawText(status.c_str(), 16, GetScreenHeight() - 58, 20, RAYWHITE);
     sanitizeEnemyTune(state);
-    if (!state.enemyAnimSetReady) {
-        DrawText(state.enemyAnimStatus.c_str(), 16, GetScreenHeight() - 82, 18, Color{255, 130, 130, 255});
+    if (ShowBottomDebugOverlay) {
+        const std::string status = state.connected
+            ? "Connected as " + state.localPlayerName + " (#" + std::to_string(state.localPlayerId) + ") | players: " + std::to_string(state.players.size())
+            : "Connecting to server...";
+        DrawText(status.c_str(), 16, GetScreenHeight() - 58, 20, RAYWHITE);
+        if (!state.enemyAnimSetReady) {
+            DrawText(state.enemyAnimStatus.c_str(), 16, GetScreenHeight() - 82, 18, Color{255, 130, 130, 255});
+        }
+        const EnemyClipAsset& idleClipDbg = state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
+        std::string srcLabel = "enemy src: n/a";
+        if (!idleClipDbg.sourcePath.empty()) {
+            const size_t slash = idleClipDbg.sourcePath.find_last_of("\\/");
+            const std::string file = (slash == std::string::npos) ? idleClipDbg.sourcePath : idleClipDbg.sourcePath.substr(slash + 1);
+            srcLabel = "enemy src: " + file;
+        }
+        DrawText(srcLabel.c_str(), 16, GetScreenHeight() - 178, 18, Color{255, 180, 120, 255});
+        DrawText(state.enemyModelDebug.c_str(), 16, GetScreenHeight() - 106, 18, Color{190, 225, 255, 255});
+        const std::string enemyTuneHud =
+            "enemy tune: scale=" + std::to_string(state.enemyTuneScale) +
+            " off(" + std::to_string(state.enemyTuneOffsetX) + "," + std::to_string(state.enemyTuneOffsetY) + "," + std::to_string(state.enemyTuneOffsetZ) + ")" +
+            " rot(" + std::to_string(state.enemyTuneRotX) + "," + std::to_string(state.enemyTuneRotY) + "," + std::to_string(state.enemyTuneRotZ) + ")";
+        DrawText(enemyTuneHud.c_str(), 16, GetScreenHeight() - 130, 18, Color{255, 210, 130, 255});
+        DrawText("I/O scale+/- | J/K x-/x+ | N/M y+/y- | L/P z-/z+ | 8/9/0 rot +90 | 7/U rotX-/+ | Y/H rotY-/+ | B/V rotZ-/+ | T reset", 16, GetScreenHeight() - 154, 18, Color{255, 210, 130, 255});
     }
-    const EnemyClipAsset& idleClipDbg = state.enemyClipAssets[static_cast<size_t>(EnemyAnimClip::Idle)];
-    std::string srcLabel = "enemy src: n/a";
-    if (!idleClipDbg.sourcePath.empty()) {
-        const size_t slash = idleClipDbg.sourcePath.find_last_of("\\/");
-        const std::string file = (slash == std::string::npos) ? idleClipDbg.sourcePath : idleClipDbg.sourcePath.substr(slash + 1);
-        srcLabel = "enemy src: " + file;
-    }
-    DrawText(srcLabel.c_str(), 16, GetScreenHeight() - 178, 18, Color{255, 180, 120, 255});
-    DrawText(state.enemyModelDebug.c_str(), 16, GetScreenHeight() - 106, 18, Color{190, 225, 255, 255});
-    const std::string enemyTuneHud =
-        "enemy tune: scale=" + std::to_string(state.enemyTuneScale) +
-        " off(" + std::to_string(state.enemyTuneOffsetX) + "," + std::to_string(state.enemyTuneOffsetY) + "," + std::to_string(state.enemyTuneOffsetZ) + ")" +
-        " rot(" + std::to_string(state.enemyTuneRotX) + "," + std::to_string(state.enemyTuneRotY) + "," + std::to_string(state.enemyTuneRotZ) + ")";
-    DrawText(enemyTuneHud.c_str(), 16, GetScreenHeight() - 130, 18, Color{255, 210, 130, 255});
-    DrawText("I/O scale+/- | J/K x-/x+ | N/M y+/y- | L/P z-/z+ | 8/9/0 rot +90 | 7/U rotX-/+ | Y/H rotY-/+ | B/V rotZ-/+ | T reset", 16, GetScreenHeight() - 154, 18, Color{255, 210, 130, 255});
 
     const std::string t1Clock = formatClock(state.team1TimeLeftSeconds);
     const std::string t2Clock = formatClock(state.team2TimeLeftSeconds);
-    const std::string topHud = "TEAM 1  " + t1Clock + "  PTS " + std::to_string(team1Points) +
-        "    |    TEAM 2  " + t2Clock + "  PTS " + std::to_string(team2Points);
+    const std::string topHud = "TEAM 1  " + t1Clock + "  PTS " + std::to_string(state.team1RoundPoints) +
+        "    |    TEAM 2  " + t2Clock + "  PTS " + std::to_string(state.team2RoundPoints);
     const int topW = MeasureText(topHud.c_str(), 30);
     const int topX = (GetScreenWidth() - topW) / 2;
     DrawRectangle(topX - 18, 10, topW + 36, 42, Color{10, 15, 24, 205});
@@ -3232,25 +3345,56 @@ void render(ClientState& state, double now) {
     const std::string teamText = "Team " + std::to_string(state.localTeamId == 0 ? 1 : state.localTeamId) +
         " | HP: " + std::to_string(state.localHealth);
     DrawText(teamText.c_str(), 16, 94, 20, RAYWHITE);
+    DrawText(TextFormat("Ping: %.0f ms", state.smoothedPingMs), 16, 120, 20, RAYWHITE);
     std::string hillText = "Hill: Neutral";
-    if (state.hillWinnerTeam != 0) {
+    if (state.matchWinnerTeam != 0) {
+        hillText = "Match Over: Team " + std::to_string(state.matchWinnerTeam) + " wins";
+    } else if (state.hillWinnerTeam != 0) {
         hillText = "Round Over: Team " + std::to_string(state.hillWinnerTeam) + " wins";
     } else if (state.hillOvertime != 0) {
         hillText = "Hill: OVERTIME";
     } else if (state.hillContested != 0) {
         hillText = "Hill: Contested";
-    }
-    if (state.hillOwnerTeam == 1) hillText = "Hill: Owned by Team 1";
-    if (state.hillOwnerTeam == 2) hillText = "Hill: Owned by Team 2";
-    if (state.hillContested == 0 && state.hillOwnerTeam == 0 && state.hillCaptureTeam != 0) {
+    } else if (state.hillOwnerTeam == 1) {
+        hillText = "Hill: Owned by Team 1";
+    } else if (state.hillOwnerTeam == 2) {
+        hillText = "Hill: Owned by Team 2";
+    } else if (state.hillCaptureTeam != 0) {
         hillText = "Hill: Team " + std::to_string(state.hillCaptureTeam) + " capturing " +
             std::to_string(static_cast<int>(state.hillCaptureProgress * 100.0f)) + "%";
     }
-    DrawText(hillText.c_str(), 16, 120, 20, Color{245, 235, 170, 255});
+    DrawText(hillText.c_str(), 16, 146, 20, Color{245, 235, 170, 255});
+    if (state.matchWinnerTeam != 0) {
+        DrawRectangle(0, 0, GetScreenWidth(), GetScreenHeight(), Color{0, 0, 0, 165});
+        const std::string winText = "TEAM " + std::to_string(state.matchWinnerTeam) + " VICTORY";
+        const int fontSize = 72;
+        const int winW = MeasureText(winText.c_str(), fontSize);
+        DrawText(winText.c_str(), (GetScreenWidth() - winW) / 2, GetScreenHeight() / 2 - 56, fontSize, Color{255, 232, 120, 255});
+        const std::string resetText = "Next match in " + std::to_string(state.matchResetSecondsLeft) + "s";
+        const int resetW = MeasureText(resetText.c_str(), 34);
+        DrawText(resetText.c_str(), (GetScreenWidth() - resetW) / 2, GetScreenHeight() / 2 + 28, 34, Color{230, 235, 245, 255});
+    }
     if (state.localDead) {
         DrawText("You are dead - respawning...", GetScreenWidth() / 2 - 190, GetScreenHeight() / 2 - 70, 30, RED);
     }
-    DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | A/D double-tap air dash | Shift crouch | 1 shotgun | 2 lightning gun | 3 knife | LMB attack/fire | F inspect | TAB scoreboard | Esc menu", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
+    int feedY = 182;
+    for (size_t i = 0; i < state.killFeed.size(); ++i) {
+        const KillFeedEntry& entry = state.killFeed[state.killFeed.size() - 1 - i];
+        const float t = std::clamp(entry.age / std::max(0.001f, entry.lifetime), 0.0f, 1.0f);
+        const unsigned char alpha = static_cast<unsigned char>((1.0f - t) * 255.0f);
+        const int fontSize = 26;
+        const int textWidth = MeasureText(entry.text.c_str(), fontSize);
+        const int x = GetScreenWidth() - textWidth - 24;
+        DrawText(entry.text.c_str(), x + 2, feedY + 2, fontSize, Color{0, 0, 0, static_cast<unsigned char>(alpha * 0.7f)});
+        DrawText(entry.text.c_str(), x, feedY, fontSize, Color{255, 80, 80, alpha});
+        feedY += 30;
+        if (feedY > GetScreenHeight() - 80) {
+            break;
+        }
+    }
+    if (ShowBottomDebugOverlay) {
+        DrawText("WASD move | Mouse look | Space/wheel-down jump | wheel-up forward | A/D double-tap air dash | Shift crouch | 1 shotgun | 2 lightning gun | 3 knife | LMB attack/fire | F inspect | TAB scoreboard | Esc menu", 16, GetScreenHeight() - 32, 18, LIGHTGRAY);
+    }
     if (keyDown(KEY_TAB)) {
         drawScoreboardOverlay(state);
     }
@@ -3276,7 +3420,7 @@ int main(int argc, char** argv) {
         }
         arena::makeNonBlocking(state.socket);
 
-        SetConfigFlags(FLAG_MSAA_4X_HINT);
+        SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_FULLSCREEN_MODE);
         InitWindow(WindowWidth, WindowHeight, "KOTH");
         SetExitKey(KEY_NULL);
         EnableCursor();
@@ -3445,6 +3589,7 @@ int main(int argc, char** argv) {
             state.damageFlash = std::max(0.0f, state.damageFlash - dt * 2.8f);
             updateSpeedCounter(state, dt);
             updateDamagePopups(state, dt);
+            updateKillFeed(state, dt);
             updateViewmodelAndFootsteps(state, now, dt);
             updateWeaponAnimationState(state, now);
             updateLightningAudio(state);
