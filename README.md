@@ -33,6 +33,38 @@ Or use the helper:
 
 `build.ps1` also works when `cmake` is not on your PATH by locating the Visual Studio bundled CMake automatically.
 
+## Share A Playtest Build
+
+Use the release packager to build and bundle a shareable Windows playtest zip:
+
+```powershell
+.\release.ps1
+```
+
+If your normal local build is `Win32` (same as `build.ps1` default), keep that default.
+If you want 64-bit explicitly, run:
+
+```powershell
+.\release.ps1 -Platform x64
+```
+
+This creates:
+
+- `dist\arena-playtest-<timestamp>\` with:
+  - `arena_server.exe`
+  - `arena_client.exe`
+  - dependency `.dll` files (if any)
+  - `assets\`
+  - `run-server.bat`
+  - `run-client.bat`
+  - `PLAYTEST-README.txt`
+- `dist\arena-playtest-<timestamp>.zip`
+
+Friends can unzip and run:
+
+- host: `run-server.bat`
+- client: `run-client.bat <HOST_IP> 40000`
+
 The old zero-dependency MSVC batch file is still useful for the server, but the raylib client now expects the CMake build.
 
 ```bat

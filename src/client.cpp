@@ -51,6 +51,17 @@ constexpr float WorldUnitsPerTextureTile = 10.0f;
 constexpr int MaxShells = 2;
 constexpr int MaxReserveAmmo = 32;
 constexpr int AmmoPickupAmount = 6;
+constexpr float SfxVolumeMaster = 1.0f;
+constexpr float SfxVolumeShotgunFire = 0.2f;
+constexpr float SfxVolumeShotgunEmpty = 0.2f;
+constexpr float SfxVolumeShotgunReload = 0.2f;
+constexpr float SfxVolumeAmmoPickup = 0.7f;
+constexpr float SfxVolumeLightningStart = 0.2f;
+constexpr float SfxVolumeLightningLoop = 0.2f;
+constexpr float SfxVolumeKnifeEquip = 0.2f;
+constexpr float SfxVolumeHitBase = 0.3f;
+constexpr float SfxVolumeFootsteps = 0.70f;
+constexpr float SfxVolumeAnnouncer = 1.00f;
 
 enum class WeaponSlot : uint8_t {
     Shotgun = 1,
@@ -323,7 +334,7 @@ struct ClientState {
     DisplayMode displayMode = DisplayMode::Windowed;
     float mouseSensitivity = DefaultMouseSensitivity;
     bool hitSoundEnabled = true;
-    float hitSoundVolume = 0.65f;
+    float hitSoundVolume = SfxVolumeHitBase;
     double mainMenuOpenedAt = 0.0;
     uint32_t localPlayerId = 0;
     std::string localPlayerName = "Player";
@@ -399,7 +410,7 @@ struct ClientState {
     bool lightningAudioLoaded = false;
     bool lightningLoopPlaying = false;
     bool lightningLoopFadingOut = false;
-    float lightningLoopVolume = 1.0f;
+    float lightningLoopVolume = SfxVolumeMaster * SfxVolumeLightningLoop;
     Sound knifeEquip{};
     Sound hitSound{};
     bool hitSoundLoaded = false;
@@ -506,6 +517,7 @@ void playAnnouncer(ClientState& state, arena::AnnouncerEvent event) {
     if (!state.audioReady || idx >= state.announcerSounds.size() || state.announcerSoundLoaded[idx] == 0) {
         return;
     }
+    SetSoundVolume(state.announcerSounds[idx], SfxVolumeMaster * SfxVolumeAnnouncer);
     PlaySound(state.announcerSounds[idx]);
 }
 
@@ -1693,12 +1705,18 @@ void initAssets(ClientState& state) {
     InitAudioDevice();
     state.audioReady = true;
     state.shotgunFire = loadSoundAsset("assets\\weapons\\doubleshotgun\\fire.wav");
+    SetSoundVolume(state.shotgunFire, SfxVolumeMaster * SfxVolumeShotgunFire);
     state.shotgunEmpty = loadSoundAsset("assets\\weapons\\doubleshotgun\\empty.wav");
+    SetSoundVolume(state.shotgunEmpty, SfxVolumeMaster * SfxVolumeShotgunEmpty);
     state.ammoPickup = loadSoundAsset("assets\\sound\\ammo.wav");
+    SetSoundVolume(state.ammoPickup, SfxVolumeMaster * SfxVolumeAmmoPickup);
     state.shotgunReloadSounds[0] = loadSoundAsset("assets\\weapons\\doubleshotgun\\reload1.wav");
     state.shotgunReloadSounds[1] = loadSoundAsset("assets\\weapons\\doubleshotgun\\reload2.wav");
     state.shotgunReloadSounds[2] = loadSoundAsset("assets\\weapons\\doubleshotgun\\reload3.wav");
     state.shotgunReloadSounds[3] = loadSoundAsset("assets\\weapons\\doubleshotgun\\reload4.wav");
+    for (Sound& reloadSound : state.shotgunReloadSounds) {
+        SetSoundVolume(reloadSound, SfxVolumeMaster * SfxVolumeShotgunReload);
+    }
     state.shotgunReloadSoundCount = 4;
     try {
         state.lightningFireStart = loadSoundAsset("assets\\weapons\\LG\\fire.ogg");
@@ -1707,14 +1725,17 @@ void initAssets(ClientState& state) {
         state.lightningFireStartAliasCount = static_cast<int>(state.lightningFireStartAliases.size());
         for (int i = 0; i < state.lightningFireStartAliasCount; ++i) {
             state.lightningFireStartAliases[i] = LoadSoundAlias(state.lightningFireStart);
+            SetSoundVolume(state.lightningFireStartAliases[i], SfxVolumeMaster * SfxVolumeLightningStart);
         }
-        state.lightningLoopVolume = 1.0f;
+        SetSoundVolume(state.lightningFireStart, SfxVolumeMaster * SfxVolumeLightningStart);
+        state.lightningLoopVolume = SfxVolumeMaster * SfxVolumeLightningLoop;
         SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
         state.lightningAudioLoaded = true;
     } catch (...) {
         state.lightningAudioLoaded = false;
     }
     state.knifeEquip = loadSoundAsset("assets\\weapons\\karambit\\equip.wav");
+    SetSoundVolume(state.knifeEquip, SfxVolumeMaster * SfxVolumeKnifeEquip);
     try {
         state.hitSound = loadSoundAsset("assets\\sound\\hit.mp3");
         state.hitSoundLoaded = state.hitSound.stream.buffer != nullptr;
@@ -1727,23 +1748,27 @@ void initAssets(ClientState& state) {
         }
     }
     if (state.hitSoundLoaded) {
-        SetSoundVolume(state.hitSound, state.hitSoundVolume);
+        SetSoundVolume(state.hitSound, SfxVolumeMaster * state.hitSoundVolume);
         state.hitSoundAliasCount = static_cast<int>(state.hitSoundAliases.size());
         for (int i = 0; i < state.hitSoundAliasCount; ++i) {
             state.hitSoundAliases[i] = LoadSoundAlias(state.hitSound);
-            SetSoundVolume(state.hitSoundAliases[i], state.hitSoundVolume);
+            SetSoundVolume(state.hitSoundAliases[i], SfxVolumeMaster * state.hitSoundVolume);
         }
     }
     state.footstepSounds[0] = loadSoundAsset("assets\\sound\\boots1.wav");
     state.footstepSounds[1] = loadSoundAsset("assets\\sound\\boots2.wav");
     state.footstepSounds[2] = loadSoundAsset("assets\\sound\\boots3.wav");
     state.footstepSounds[3] = loadSoundAsset("assets\\sound\\boots4.wav");
+    for (Sound& footstepSound : state.footstepSounds) {
+        SetSoundVolume(footstepSound, SfxVolumeMaster * SfxVolumeFootsteps);
+    }
     state.footstepSoundCount = 4;
     state.announcerSoundLoaded.fill(0);
     auto loadAnnouncer = [&](arena::AnnouncerEvent event, const char* path) {
         try {
             const size_t idx = announcerIndex(event);
             state.announcerSounds[idx] = loadSoundAsset(path);
+            SetSoundVolume(state.announcerSounds[idx], SfxVolumeMaster * SfxVolumeAnnouncer);
             state.announcerSoundLoaded[idx] = (state.announcerSounds[idx].stream.buffer != nullptr) ? 1 : 0;
         } catch (...) {
             // Optional content: skip missing announcer clips.
@@ -1764,12 +1789,14 @@ void initAssets(ClientState& state) {
     loadAnnouncer(arena::AnnouncerEvent::CountFive, "assets\\sound\\announcer\\[Half-Life VOX]Five_8000hz.mp3");
     try {
         state.announcerWeCaptured = loadSoundAsset("assets\\sound\\announcer\\[Half-Life VOX]We ha......oint._8000hz.mp3");
+        SetSoundVolume(state.announcerWeCaptured, SfxVolumeMaster * SfxVolumeAnnouncer);
         state.announcerWeCapturedLoaded = state.announcerWeCaptured.stream.buffer != nullptr;
     } catch (...) {
         state.announcerWeCapturedLoaded = false;
     }
     try {
         state.announcerWeLost = loadSoundAsset("assets\\sound\\announcer\\[Half-Life VOX]We ha......oint.(1)_8000hz.mp3");
+        SetSoundVolume(state.announcerWeLost, SfxVolumeMaster * SfxVolumeAnnouncer);
         state.announcerWeLostLoaded = state.announcerWeLost.stream.buffer != nullptr;
     } catch (...) {
         state.announcerWeLostLoaded = false;
@@ -1812,7 +1839,7 @@ void unloadAssets(ClientState& state) {
             state.lightningAudioLoaded = false;
             state.lightningLoopPlaying = false;
             state.lightningLoopFadingOut = false;
-            state.lightningLoopVolume = 1.0f;
+            state.lightningLoopVolume = SfxVolumeMaster * SfxVolumeLightningLoop;
         }
         UnloadSound(state.knifeEquip);
         if (state.hitSoundLoaded) {
@@ -1927,7 +1954,7 @@ void updateLightningAudio(ClientState& state) {
     const bool lgFiring = state.equippedWeapon == WeaponSlot::LightningGun && state.weaponAnimMode == WeaponAnimMode::LightningGunFiring;
     if (lgFiring) {
         if (!state.lightningLoopPlaying) {
-            state.lightningLoopVolume = 1.0f;
+            state.lightningLoopVolume = SfxVolumeMaster * SfxVolumeLightningLoop;
             SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
             PlayMusicStream(state.lightningFireLoop);
             state.lightningLoopPlaying = true;
@@ -1944,7 +1971,7 @@ void updateLightningAudio(ClientState& state) {
             StopMusicStream(state.lightningFireLoop);
             state.lightningLoopPlaying = false;
             state.lightningLoopFadingOut = false;
-            state.lightningLoopVolume = 1.0f;
+            state.lightningLoopVolume = SfxVolumeMaster * SfxVolumeLightningLoop;
             SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
         }
     }
@@ -2151,9 +2178,9 @@ void drawSettingsMenu(ClientState& state) {
         if (leftAdjust) state.hitSoundVolume = std::max(0.0f, state.hitSoundVolume - 0.05f);
         if (rightAdjust) state.hitSoundVolume = std::min(1.0f, state.hitSoundVolume + 0.05f);
         if (state.hitSoundLoaded) {
-            SetSoundVolume(state.hitSound, state.hitSoundVolume);
+            SetSoundVolume(state.hitSound, SfxVolumeMaster * state.hitSoundVolume);
             for (int i = 0; i < state.hitSoundAliasCount; ++i) {
-                SetSoundVolume(state.hitSoundAliases[i], state.hitSoundVolume);
+                SetSoundVolume(state.hitSoundAliases[i], SfxVolumeMaster * state.hitSoundVolume);
             }
         }
     }
@@ -3831,7 +3858,7 @@ int main(int argc, char** argv) {
                     StopMusicStream(state.lightningFireLoop);
                     state.lightningLoopPlaying = false;
                     state.lightningLoopFadingOut = false;
-                    state.lightningLoopVolume = 1.0f;
+                    state.lightningLoopVolume = SfxVolumeMaster * SfxVolumeLightningLoop;
                     SetMusicVolume(state.lightningFireLoop, state.lightningLoopVolume);
                 }
                 state.mainMenuOpenedAt = GetTime();

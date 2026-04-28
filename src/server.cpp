@@ -62,6 +62,7 @@ constexpr double MatchVictoryScreenSeconds = 6.0;
 constexpr float MapCollisionScale = 3.879997f;
 constexpr arena::Vec3 MapCollisionOffset{0.0f, -4.0f, 0.0f};
 constexpr arena::Vec3 MapCollisionRotationDeg{270.0f, 0.0f, 0.0f};
+constexpr float RampStepHeight = 0.60f;
 
 float computeDistanceFalloffDamage(float distance, float maxRange, int nearDamage, int farDamage) {
     if (maxRange <= 0.0001f) {
@@ -402,28 +403,46 @@ float rampSurfaceYAt(const StaticSolid& s, float x, float z) {
 
 void resolveHorizontalMapCollisions(arena::Vec3& position, arena::Vec3& velocity, float currentHeight) {
     const float radius = arena::PlayerRadius;
-    const float playerBottom = position.y;
-    const float playerTop = playerBottom + currentHeight;
 
     for (int iter = 0; iter < 3; ++iter) {
         bool resolvedAny = false;
+        const float playerBottom = position.y;
+        const float playerTop = playerBottom + currentHeight;
         for (const StaticSolid& s : worldMap().solids) {
             const float minY = s.center.y - s.size.y * 0.5f;
             const float maxY = s.center.y + s.size.y * 0.5f;
-            if (s.isRamp) {
-                const float rampY = rampSurfaceYAt(s, position.x, position.z);
-                if (playerBottom >= rampY - 0.01f) {
-                    continue;
-                }
-            }
-            if (playerTop <= minY || playerBottom >= maxY) {
-                continue;
-            }
-
             const float minX = s.center.x - s.size.x * 0.5f;
             const float maxX = s.center.x + s.size.x * 0.5f;
             const float minZ = s.center.z - s.size.z * 0.5f;
             const float maxZ = s.center.z + s.size.z * 0.5f;
+            if (s.isRamp) {
+                const float rampY = rampSurfaceYAt(s, position.x, position.z);
+                // While traversing/landing on the sloped body, let vertical ramp grounding handle contact.
+                // Horizontal blocking is only needed at the steep high-side wall.
+                if (playerBottom >= rampY - RampStepHeight) {
+                    continue;
+                }
+                const float playerMinX = position.x - radius;
+                const float playerMaxX = position.x + radius;
+                const float playerMinZ = position.z - radius;
+                const float playerMaxZ = position.z + radius;
+                if (playerMaxX <= minX || playerMinX >= maxX || playerMaxZ <= minZ || playerMinZ >= maxZ) {
+                    continue;
+                }
+                // Ignore side/front/back pushes on ramps; only clamp against the vertical high wall at maxX.
+                const float allowedX = maxX - radius - 0.001f;
+                if (position.x > allowedX) {
+                    position.x = allowedX;
+                    if (velocity.x > 0.0f) {
+                        velocity.x = 0.0f;
+                    }
+                    resolvedAny = true;
+                }
+                continue;
+            }
+            if (playerTop <= minY || playerBottom >= maxY) {
+                continue;
+            }
 
             const float playerMinX = position.x - radius;
             const float playerMaxX = position.x + radius;
@@ -467,7 +486,8 @@ bool resolveVerticalMapCollisions(arena::Vec3& position, float& velocityY, float
         }
         if (s.isRamp) {
             const float rampY = rampSurfaceYAt(s, position.x, position.z);
-            if (velocityY <= 0.0f && prevY >= rampY && position.y <= rampY) {
+            // Allow stepping onto ramps from nearby floor height, not only falling from above.
+            if (velocityY <= 0.0f && position.y <= rampY + RampStepHeight) {
                 position.y = rampY;
                 velocityY = 0.0f;
                 landed = true;

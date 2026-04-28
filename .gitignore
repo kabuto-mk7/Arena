@@ -1,8 +1,25 @@
 build/
+dist/
+dist/*.zip
+node_modules/
 .vs/
 *.user
 *.obj
 *.exe
 *.pdb
 *.ilk
+*.log
+.DS_Store
+Thumbs.db
 
+# CMake/Ninja generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Large local artifacts
+assets.rar
